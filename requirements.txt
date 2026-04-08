@@ -1,0 +1,19 @@
+# torch related
+# 此处我尝试用更新版本的torch和torchvision替代原有版本，但不确定是否可行，如果不可行，应该按照install.md中的提示，把python降低为3.7版本。
+# torch>=2.2,<3
+# torchvision>=0.17,<0.18
+
+# hovorod最新只能支持torch2.1.2，现在安装的torch2.4.1无法支持。幸好CUDA11.8可以支持torch2.1.2，torch2.0.1更加稳定。
+#python3.8 -m pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \                                       
+# --index-url https://download.pytorch.org/whl/cu118
+ 
+--extra-index-url https://download.pytorch.org/whl/cu118
+# torch>=2.0.0
+# torchvision>=0.15.0
+# transformer related
+transformers>=4.0.0
+
+# others
+bayesian-optimization==1.2.0
+mpi4py==3.1.1
+wandb>=0.13,<1

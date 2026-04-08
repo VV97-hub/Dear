@@ -1,0 +1,24 @@
+## ignore this file ##
+*.pth
+*.log
+*.pyc
+*.swp
+*.swo
+*.pfm
+*_local.sh
+tmp
+data*
+weights
+.nfs*
+runs
+*.ipynb
+*.npy
+bk/
+*.npy*
+*.whl
+*.pt
+*.safetensors
+*.out
+*.zip
+__pycache__/
+.git/

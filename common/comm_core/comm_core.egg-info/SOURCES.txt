@@ -1,0 +1,10 @@
+setup.py
+comm_core.egg-info/PKG-INFO
+comm_core.egg-info/SOURCES.txt
+comm_core.egg-info/dependency_links.txt
+comm_core.egg-info/not-zip-safe
+comm_core.egg-info/requires.txt
+comm_core.egg-info/top_level.txt
+src/comm_core.cpp
+src/communicator.cpp
+tests/test_comm.py

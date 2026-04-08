@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: comm_core
+Version: 0.1.1
+Summary: Efficient PyTorch Extension for Communication based on NCCL
+Author: Shaohuai Shi
+Author-email: shaohuais@cse.ust.hk
+Keywords: Pytorch C++ Extension
+Requires-Dist: torch
