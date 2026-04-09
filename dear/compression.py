@@ -66,7 +66,7 @@ class HalfRankKReducer(Reducer):
         self.p_memory = {}          # {key: Tensor(n, rank)}
         self.q_memory = {}          # {key: Tensor(m, rank)}
         self.residuals = {}         # {key: Tensor(n, m)}  Error Feedback残差
-        self.last_input = {}        # {key: Tensor(n, m)}  上一轮原始梯度，用于更新残差
+        self.last_input = {}        # {key: Tensor(n, m)}  保留调试信息
 
         # 记录每个key上次使用的rank，用于检测rank是否发生变化
         # 结构：{key: int}
@@ -81,10 +81,26 @@ class HalfRankKReducer(Reducer):
 
         self.device = device
 
-    def should_compress_tensor(self, tensor):
+    def _should_skip_by_name(self, name):
+        if not name:
+            return False
+        lower_name = name.lower()
+        if lower_name.endswith("bias") or ".bias" in lower_name:
+            return True
+        if "embedding" in lower_name or "embeddings" in lower_name:
+            return True
+        if "layernorm" in lower_name or "layer_norm" in lower_name:
+            return True
+        return False
+
+    def should_compress_tensor(self, tensor, name=None):
+        if self._should_skip_by_name(name):
+            return False
         return tensor.ndimension() > 1 and tensor.numel() >= self.min_compression_numel
 
-    def should_compress_shape(self, shape):
+    def should_compress_shape(self, shape, name=None):
+        if self._should_skip_by_name(name):
+            return False
         if len(shape) <= 1:
             return False
         numel = 1
@@ -207,7 +223,7 @@ class HalfRankKReducer(Reducer):
           - 若rank与上次不同，_maybe_reset_memory会清空该key的所有历史；
           - 之后按新rank重新初始化p/q，流程与固定rank完全一致。
         """
-        if not self.should_compress_tensor(tensor):
+        if not self.should_compress_tensor(tensor, name=name):
             # 一维tensor不压缩（如bias），直接透传
             return tensor, None, None
 
@@ -231,8 +247,8 @@ class HalfRankKReducer(Reducer):
             self.residuals[key] = torch.zeros_like(matrix)
 
 
-        # [EF] 使用“梯度 + 历史残差”作为本轮被压缩目标
-        # 残差更新也必须基于这个张量，否则会丢失误差反馈链条。
+        # [EF] 使用“梯度 + 历史残差”作为本轮被压缩目标。
+        # 这里保持 ACP-SGD 语义：残差在本地压缩阶段更新，而不是等通信后再更新。
         matrix = matrix + self.residuals[key]
         self.last_input[key] = matrix.clone()
 
@@ -253,12 +269,14 @@ class HalfRankKReducer(Reducer):
                 orthogonalize(q)
                 torch.matmul(matrix, q, out=p)
                 self.p_memory[key] = p
+                self.residuals[key].copy_(matrix - p @ q.t())
                 return p.clone(), None, None
             else:
                 # 奇数步：用当前p投影，计算q = M^T @ p
                 orthogonalize(p)
                 torch.matmul(matrix.t(), p, out=q)
                 self.q_memory[key] = q
+                self.residuals[key].copy_(matrix - p @ q.t())
                 return q.clone(), None, None
 
     def decompress(self, compressed_data, original_tensor_size, numel, name, step=0):
@@ -275,7 +293,7 @@ class HalfRankKReducer(Reducer):
         if compressed_data is None:
             return torch.zeros(original_tensor_size)
 
-        if not self.should_compress_shape(original_tensor_size):
+        if not self.should_compress_shape(original_tensor_size, name=name):
             # 一维tensor compress时直接透传，decompress同样直接返回
             return compressed_data.view(original_tensor_size)
 
@@ -295,14 +313,9 @@ class HalfRankKReducer(Reducer):
             with torch.no_grad():
                 q.copy_(compressed_data.view(q.shape))
 
-        # 用通信后的p和q重构低秩近似梯度
+        # 用通信后的平均因子和本地保留因子重构低秩近似梯度。
+        # 残差已经在 compress() 中按本地压缩误差更新，这里不再覆盖 residual。
         reconstructed = p @ q.t()
-
-        # [EF] 更新残差：残差 = 原始梯度 - 低秩近似（量化误差的累积）
-        # last_input存的是compress时的original_matrix（不含旧residual）
-        if key in self.last_input:
-            with torch.no_grad():
-                self.residuals[key] = self.last_input[key] - reconstructed
 
         return reconstructed.view(original_tensor_size)
         

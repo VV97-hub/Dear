@@ -485,35 +485,9 @@ def _adjust_lr(step):
     for group in optimizer.param_groups:
         group['lr'] = new_lr
 """
-# cosine decay + 清零动量状态
 def _adjust_lr(step):
-    if step < WARMUP_STEPS:
-        return
-
-    # 压缩切换点：降 lr + 清零动量状态
-    if step == WARMUP_STEPS:
-        if hvd.rank() == 0:
-            print(f"[LR] step={step}, compression activated, resetting Adam state")
-        for group in optimizer.param_groups:
-            for p in group['params']:
-                if p in optimizer.state and len(optimizer.state[p]) > 0:
-                    optimizer.state[p]['exp_avg'].zero_()
-                    optimizer.state[p]['exp_avg_sq'].zero_()
-
-    # 压缩阶段：cosine decay，从 0.5*BASE_LR 衰减到 0.05*BASE_LR
-    compress_step = step - WARMUP_STEPS
-    total_compress_steps = args.num_iters * args.num_batches_per_iter - WARMUP_STEPS
-    total_compress_steps = max(total_compress_steps, 1)  # 防止除零
-
-    cosine_decay = 0.5 * (1 + math.cos(math.pi * compress_step / total_compress_steps))
-    # 在 [0.05, 0.5] * BASE_LR 之间衰减，不衰减到 0
-    new_lr = BASE_LR * (0.05 + 0.45 * cosine_decay)
-
-    for group in optimizer.param_groups:
-        group['lr'] = new_lr
-
-    if hvd.rank() == 0 and step % 500 == 0:
-        print(f"[LR] step={step}, lr={new_lr:.2e}")
+    # 暂时停用压缩阶段的 lr / optimizer state 调整，先单独观察压缩算法本身。
+    return
 
         
             

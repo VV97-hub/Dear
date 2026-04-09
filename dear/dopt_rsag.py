@@ -213,7 +213,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         name = self._param_names[p]
                         use_low_rank = True
                         if hasattr(self._compression, 'should_compress_tensor'):
-                            use_low_rank = self._compression.should_compress_tensor(p)
+                            use_low_rank = self._compression.should_compress_tensor(p, name=name)
                         else:
                             use_low_rank = p.ndimension() > 1
 
@@ -449,7 +449,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 # 判断逻辑要与 compress 严格一致
                 use_low_rank = True
                 if hasattr(self._compression, 'should_compress_tensor'):
-                    use_low_rank = self._compression.should_compress_tensor(p)
+                    use_low_rank = self._compression.should_compress_tensor(p, name=name)
                 else:
                     use_low_rank = p.ndimension() > 1
 
