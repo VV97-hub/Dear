@@ -72,6 +72,8 @@ parser.add_argument('--exclude-parts', type=str, default='', help='choices: redu
 # 动态rank增加：
 parser.add_argument('--compress-rank', type=int, default=8)
 parser.add_argument('--compress-warmup', type=int, default=1000)
+parser.add_argument('--compress-min-numel', type=int, default=16384,
+                    help='do not apply low-rank compression when tensor.numel() is below this threshold')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
 parser.add_argument('--rank-schedule', type=str, default=None,
                     choices=[None, 'aggressive', 'gentle','cosine','warmup_decay'])
@@ -112,6 +114,7 @@ print(
 print("===== Dynamic_rank Training Config =====")
 print(f"compress_rank: {args.compress_rank}")
 print(f"compress_warmup: {args.compress_warmup}")
+print(f"compress_min_numel: {args.compress_min_numel}")
 print(f"rank_schedule: {args.rank_schedule}")
 print(f"local_rank: {args.local_rank}")
 print("========================================")
@@ -425,7 +428,8 @@ if hvd.size() > 1:
                                          (device=torch.device('cuda', args.local_rank),
     rank=args.compress_rank,
     rank_schedule=RANK_SCHEDULES[args.rank_schedule],
-    warmup_steps=args.compress_warmup,), 
+    warmup_steps=args.compress_warmup,
+    min_compression_numel=args.compress_min_numel,), 
 
     is_sparse=args.density<1, density=args.density, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=1, threshold=args.threshold, writer=None, gradient_path='./', fp16=args.fp16, mgwfbp=args.mgwfbp, rdma=args.rdma, exclude_parts=args.exclude_parts)
     
@@ -533,8 +537,9 @@ def benchmark_step():
     next_sentence_label = batch['next_sentence_label']
     masked_lm_labels  = batch['masked_lm_labels']
 
-    # ✅ 在这里加学习率调整
-    # _adjust_lr(step)
+    # 压缩切换后降低学习率并做cosine衰减，缓解压缩噪声带来的优化震荡
+    if args.compressor != 'none':
+        _adjust_lr(step)
 
     optimizer.zero_grad()
 

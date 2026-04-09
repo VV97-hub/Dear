@@ -41,7 +41,7 @@ class HalfRankKReducer(Reducer):
     """
 
     def __init__(self, random_seed=0, device=None, timer=None, rank=2,
-                 rank_schedule=None, warmup_steps=200):
+                 rank_schedule=None, warmup_steps=200, min_compression_numel=16384):
         """
         参数说明：
           rank          : 默认/初始rank值，当rank_schedule未覆盖当前step时使用。
@@ -76,8 +76,21 @@ class HalfRankKReducer(Reducer):
         self.name = 'halfrankk'
 
         self.warmup_steps = warmup_steps  # 供 dopt_rsag 读取，替换硬编码的 6000
+        # 仅压缩“大张量”，小张量走原始通信以降低精度损失
+        self.min_compression_numel = int(min_compression_numel)
 
         self.device = device
+
+    def should_compress_tensor(self, tensor):
+        return tensor.ndimension() > 1 and tensor.numel() >= self.min_compression_numel
+
+    def should_compress_shape(self, shape):
+        if len(shape) <= 1:
+            return False
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        return numel >= self.min_compression_numel
 
     # ------------------------------------------------------------------
     # 工具方法：根据当前step计算本轮实际使用的rank
@@ -194,7 +207,7 @@ class HalfRankKReducer(Reducer):
           - 若rank与上次不同，_maybe_reset_memory会清空该key的所有历史；
           - 之后按新rank重新初始化p/q，流程与固定rank完全一致。
         """
-        if tensor.ndimension() <= 1:
+        if not self.should_compress_tensor(tensor):
             # 一维tensor不压缩（如bias），直接透传
             return tensor, None, None
 
@@ -218,11 +231,10 @@ class HalfRankKReducer(Reducer):
             self.residuals[key] = torch.zeros_like(matrix)
 
 
-        # 保存原始梯度，用于后续更新residual（已经包含残差值了）
-        original_matrix = matrix.clone()
-
-        # [EF] 加入上一轮的残差误差
+        # [EF] 使用“梯度 + 历史残差”作为本轮被压缩目标
+        # 残差更新也必须基于这个张量，否则会丢失误差反馈链条。
         matrix = matrix + self.residuals[key]
+        self.last_input[key] = matrix.clone()
 
         # 初始化p/q内存（首次或rank切换后重建，形状由当前rank决定）
         if key not in self.p_memory:
@@ -241,15 +253,12 @@ class HalfRankKReducer(Reducer):
                 orthogonalize(q)
                 torch.matmul(matrix, q, out=p)
                 self.p_memory[key] = p
-                # 暂存原始梯度，供decompress更新residual时使用
-                self.last_input[key] = original_matrix
                 return p.clone(), None, None
             else:
                 # 奇数步：用当前p投影，计算q = M^T @ p
                 orthogonalize(p)
                 torch.matmul(matrix.t(), p, out=q)
                 self.q_memory[key] = q
-                self.last_input[key] = original_matrix
                 return q.clone(), None, None
 
     def decompress(self, compressed_data, original_tensor_size, numel, name, step=0):
@@ -266,7 +275,7 @@ class HalfRankKReducer(Reducer):
         if compressed_data is None:
             return torch.zeros(original_tensor_size)
 
-        if len(original_tensor_size) <= 1:
+        if not self.should_compress_shape(original_tensor_size):
             # 一维tensor compress时直接透传，decompress同样直接返回
             return compressed_data.view(original_tensor_size)
 

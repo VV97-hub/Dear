@@ -211,8 +211,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     module_name = self._module_names[module]
                     for p in self._module_direct_parameters[module_name]:
                         name = self._param_names[p]
-                        if p.ndimension() <= 1:
-                        # 1D tensor 不压缩，大小就是本身
+                        use_low_rank = True
+                        if hasattr(self._compression, 'should_compress_tensor'):
+                            use_low_rank = self._compression.should_compress_tensor(p)
+                        else:
+                            use_low_rank = p.ndimension() > 1
+
+                        if not use_low_rank:
+                        # 小 tensor 或 1D tensor 不压缩，大小就是本身
                             compressed_size = p.numel()
                         else:
                             matrix = p.data.view(p.shape[0], -1)
@@ -441,7 +447,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             if self._compression and self._num_steps > self._compression.warmup_steps + 1: # +1 因为此时step+1了
                 _, start, end = self._compressed_param_offsets[name]
                 # 判断逻辑要与 compress 严格一致
-                if p.ndimension() > 1:
+                use_low_rank = True
+                if hasattr(self._compression, 'should_compress_tensor'):
+                    use_low_rank = self._compression.should_compress_tensor(p)
+                else:
+                    use_low_rank = p.ndimension() > 1
+
+                if use_low_rank:
                     # 矩阵：根据 step 偏移决定取 P 还是 Q.在 PowerSGD 中，P 和 Q 维度不同。我们需要知道当前这一步对应的向量到底占了多少长度。
                     n, m = p.shape[0], p.view(p.shape[0], -1).shape[1]
 
@@ -454,14 +466,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     else:
                         curr_size = m * rank_c
                 else:
-                # 一维向量：直接取全部
+                # 一维向量或较小向量：直接取全部
                     curr_size = p.numel()
                 
                 compressed_vector = self._compressed_pad_buffers[group_idx][start:start + curr_size]
-                decompressed_grad = self._compression.decompress(compressed_vector, p.size(), p.numel(), name, step=self._num_steps)
-                grad = self._compression.decompress(          # ✅ 赋值给 grad
-                compressed_vector, p.size(), p.numel(), name, step=self._num_steps
-            )
+                grad = self._compression.decompress(
+                    compressed_vector, p.size(), p.numel(), name, step=self._num_steps
+                )
             else:
                 group_idx_p, _, start_p, end_p = self._param_group_idx[name]
                 grad = self._pad_buffers[group_idx][start_p:end_p].view(p.shape).clone()  # ✅ 赋值给 grad
