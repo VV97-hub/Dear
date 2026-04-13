@@ -81,6 +81,16 @@ class HalfRankKReducer(Reducer):
 
         self.device = device
 
+    def is_p_step(self, step):
+        return step % 2 == 0
+
+    def factor_kind(self, step):
+        return 'p' if self.is_p_step(step) else 'q'
+
+    def factor_kind_for_update(self, step):
+        # dopt_rsag.step() 在 backward 之后自增 step，因此更新阶段需要回看上一轮发送的因子。
+        return 'p' if step % 2 != 0 else 'q'
+
     def _should_skip_by_name(self, name):
         if not name:
             return False
@@ -209,10 +219,41 @@ class HalfRankKReducer(Reducer):
         key = (name, tuple(shape))
         return self.rank_memory.get(key, self.default_rank)
 
+    def get_factor_numel(self, shape, name=None, factor_kind='p', rank=None):
+        if not self.should_compress_shape(shape, name=name):
+            numel = 1
+            for dim in shape:
+                numel *= int(dim)
+            return numel
+
+        n = int(shape[0])
+        m = 1
+        for dim in shape[1:]:
+            m *= int(dim)
+        if rank is None:
+            rank = self.rank
+        rank = min(n, m, rank)
+        if factor_kind == 'p':
+            return n * rank
+        return m * rank
+
+    def _orthogonalize_factor(self, factor):
+        if factor.numel() == 0:
+            return
+        if factor.shape[1] == 1:
+            col = factor[:, :1]
+            col /= torch.linalg.vector_norm(col) + 1e-8
+            return
+        try:
+            q = torch.linalg.qr(factor, mode='reduced').Q
+            factor.copy_(q)
+        except RuntimeError:
+            orthogonalize(factor)
+
     def set_random(self, vector):
         torch.manual_seed(self.rng.randint(1_000_000_000))
         vector.data[:] = torch.randn(*vector.shape, device=self.device)
-        orthogonalize(vector)
+        self._orthogonalize_factor(vector)
 
     def compress(self, tensor, name=None, step=0, **kwargs):
         """
@@ -231,8 +272,8 @@ class HalfRankKReducer(Reducer):
             name = 'default'
 
         # reshape为二维矩阵：第0维保持，其余flatten
-        matrix = tensor.reshape(tensor.shape[0], -1)
-        n, m = matrix.shape
+        grad_matrix = tensor.reshape(tensor.shape[0], -1)
+        n, m = grad_matrix.shape
 
         # ---- 动态rank核心：计算本轮rank并按需重建内存 ----
         rank = self._get_rank(step, n, m)
@@ -244,19 +285,22 @@ class HalfRankKReducer(Reducer):
 
         # [EF] 初始化residual（首次或rank切换后重建）
         if key not in self.residuals:
-            self.residuals[key] = torch.zeros_like(matrix)
+            self.residuals[key] = torch.zeros_like(grad_matrix)
 
 
         # [EF] 使用“梯度 + 历史残差”作为本轮被压缩目标。
         # 这里保持 ACP-SGD 语义：残差在本地压缩阶段更新，而不是等通信后再更新。
-        matrix = matrix + self.residuals[key]
+        residual = self.residuals[key]
+        matrix = grad_matrix + residual
         self.last_input[key] = matrix.clone()
 
         # 初始化p/q内存（首次或rank切换后重建，形状由当前rank决定）
         if key not in self.p_memory:
             self.p_memory[key] = torch.zeros(n, rank, device=tensor.device)
             self.q_memory[key] = torch.zeros(m, rank, device=tensor.device)
-            # 首次随机正交初始化q，保证第一步p计算质量
+            # ACP-SGD 会为两个因子都保留持久状态；rank 切换后也重新随机化两者，
+            # 避免在 q-step 上用全零的 P 退化成空更新。
+            self.set_random(self.p_memory[key])
             self.set_random(self.q_memory[key])
 
         p = self.p_memory[key]
@@ -264,22 +308,22 @@ class HalfRankKReducer(Reducer):
 
         # 压缩计算在no_grad下进行，避免污染反向传播计算图
         with torch.no_grad():
-            if step % 2 == 0:
+            if self.is_p_step(step):
                 # 偶数步：用当前q投影，计算p = M @ q
-                orthogonalize(q)
+                self._orthogonalize_factor(q)
                 torch.matmul(matrix, q, out=p)
                 self.p_memory[key] = p
-                self.residuals[key].copy_(matrix - p @ q.t())
+                residual.add_(grad_matrix - p @ q.t())
                 return p.clone(), None, None
             else:
                 # 奇数步：用当前p投影，计算q = M^T @ p
-                orthogonalize(p)
+                self._orthogonalize_factor(p)
                 torch.matmul(matrix.t(), p, out=q)
                 self.q_memory[key] = q
-                self.residuals[key].copy_(matrix - p @ q.t())
+                residual.add_(grad_matrix - p @ q.t())
                 return q.clone(), None, None
 
-    def decompress(self, compressed_data, original_tensor_size, numel, name, step=0):
+    def decompress(self, compressed_data, original_tensor_size, numel, name, step=0, factor_kind=None):
         """
         用通信后的p或q重构梯度，并更新Error Feedback残差。
 
@@ -301,10 +345,11 @@ class HalfRankKReducer(Reducer):
         p = self.p_memory[key]
         q = self.q_memory[key]
 
-        # 注意：dopt_rsag的step()在backward之后执行，此时step已是N+1。
-        # compress(step=N偶数) → 压缩p；decompress(step=N+1奇数) → 覆盖p。
-        # 奇偶判断与compress镜像对称，保证覆盖的是本轮通信的那个向量。
-        if step % 2 != 0:
+        if factor_kind is None:
+            factor_kind = self.factor_kind_for_update(step)
+
+        # 注意：dopt_rsag 的 step() 在 backward 之后自增，因此更新阶段使用的是上一轮发送的因子。
+        if factor_kind == 'p':
             # 奇数step：本轮通信的是p，用allreduce结果覆盖p
             with torch.no_grad():
                 p.copy_(compressed_data.view(p.shape))
@@ -814,5 +859,6 @@ compressors = {
 
         'signum': SignCompressor,
         'efsignum': EFSignCompressor,
-        'halfrankk':HalfRankKReducer
+        'halfrankk':HalfRankKReducer,
+        'acpsgd': HalfRankKReducer,
         }

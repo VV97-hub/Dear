@@ -74,6 +74,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._num_steps = 0
         self._grad_accs = []
         self._compression = compression  # 保存为实例属性（压缩新增）
+        self._active_compression_factor = None
         self.param_to_group = {}
         for group in self.param_groups:
             for p in group['params']:
@@ -203,10 +204,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         # 压缩新增：为每个参数记录压缩后在 pad_buffer 中的位置
         if self._compression :
-            self._compressed_param_offsets = {}  # name -> (group_idx, start, end)
-            compressed_group_sizes = []
+            self._compressed_param_offsets_p = {}  # name -> (group_idx, start, end)
+            self._compressed_param_offsets_q = {}  # name -> (group_idx, start, end)
+            compressed_group_sizes_p = []
+            compressed_group_sizes_q = []
             for group_idx, module_group in enumerate(module_groups):
-                offset = 0
+                offset_p = 0
+                offset_q = 0
                 for module in module_group:
                     module_name = self._module_names[module]
                     for p in self._module_direct_parameters[module_name]:
@@ -218,29 +222,48 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                             use_low_rank = p.ndimension() > 1
 
                         if not use_low_rank:
-                        # 小 tensor 或 1D tensor 不压缩，大小就是本身
-                            compressed_size = p.numel()
+                            p_size = p.numel()
+                            q_size = p.numel()
                         else:
-                            matrix = p.data.view(p.shape[0], -1)
-                            n, m = matrix.shape
-                            rank_compression = min(n, m, self._compression.rank)
-                            # 保守起见取 max，因为 p 和 q 交替传
-                            compressed_size = max(n * rank_compression, m * rank_compression)
-                        self._compressed_param_offsets[name] = (group_idx, offset, offset + compressed_size)
-                        offset += compressed_size
-                compressed_group_sizes.append(offset)
+                            rank_compression = self._compression.rank
+                            p_size = self._compression.get_factor_numel(
+                                p.shape, name=name, factor_kind='p', rank=rank_compression
+                            )
+                            q_size = self._compression.get_factor_numel(
+                                p.shape, name=name, factor_kind='q', rank=rank_compression
+                            )
+                        self._compressed_param_offsets_p[name] = (
+                            group_idx, offset_p, offset_p + p_size
+                        )
+                        self._compressed_param_offsets_q[name] = (
+                            group_idx, offset_q, offset_q + q_size
+                        )
+                        offset_p += p_size
+                        offset_q += q_size
+                compressed_group_sizes_p.append(offset_p)
+                compressed_group_sizes_q.append(offset_q)
 
             # 新建压缩专用的 pad_buffer 和 shard_buffer
-            self._compressed_pad_buffers = []
-            self._compressed_shard_buffers = []
-            for group_idx, total_size in enumerate(compressed_group_sizes):
+            self._compressed_pad_buffers_p = []
+            self._compressed_shard_buffers_p = []
+            self._compressed_pad_buffers_q = []
+            self._compressed_shard_buffers_q = []
+            for group_idx, total_size in enumerate(compressed_group_sizes_p):
                 pad_num = size() - total_size % size()
                 if total_size % size() == 0:
                     pad_num = 0
-                self._compressed_pad_buffers.append(
-                    torch.empty(total_size + pad_num, device=self._pad_buffers[group_idx].device))
-                self._compressed_shard_buffers.append(
-                    torch.empty((total_size + pad_num) // size(), device=self._pad_buffers[group_idx].device))
+                self._compressed_pad_buffers_p.append(
+                    torch.zeros(total_size + pad_num, device=self._pad_buffers[group_idx].device))
+                self._compressed_shard_buffers_p.append(
+                    torch.zeros((total_size + pad_num) // size(), device=self._pad_buffers[group_idx].device))
+            for group_idx, total_size in enumerate(compressed_group_sizes_q):
+                pad_num = size() - total_size % size()
+                if total_size % size() == 0:
+                    pad_num = 0
+                self._compressed_pad_buffers_q.append(
+                    torch.zeros(total_size + pad_num, device=self._pad_buffers[group_idx].device))
+                self._compressed_shard_buffers_q.append(
+                    torch.zeros((total_size + pad_num) // size(), device=self._pad_buffers[group_idx].device))
         
     @torch.no_grad()
     def _get_pad_tensor(self, tensor, numel, size): 
@@ -251,6 +274,23 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         pad_tensor = tensor.new_empty(numel+pad_num)
         shard_tensor = tensor.new_empty((numel+pad_num) // size)
         return pad_num, pad_tensor, shard_tensor
+
+    def _compression_factor_kind(self, step=None):
+        if step is None:
+            step = self._num_steps
+        if hasattr(self._compression, 'factor_kind'):
+            return self._compression.factor_kind(step)
+        return 'p' if step % 2 == 0 else 'q'
+
+    def _compression_offsets_for_factor(self, factor_kind):
+        if factor_kind == 'p':
+            return self._compressed_param_offsets_p
+        return self._compressed_param_offsets_q
+
+    def _compression_buffers_for_factor(self, factor_kind):
+        if factor_kind == 'p':
+            return self._compressed_pad_buffers_p, self._compressed_shard_buffers_p
+        return self._compressed_pad_buffers_q, self._compressed_shard_buffers_q
 
     def _register_hooks(self):
         """
@@ -332,20 +372,25 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             tensor = grad   # ✅ 用这个！！！
 
             if self._compression and self._num_steps > self._compression.warmup_steps:
+                factor_kind = self._compression_factor_kind(self._num_steps)
+                compressed_offsets = self._compression_offsets_for_factor(factor_kind)
+                compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(factor_kind)
 
                 # 调用压缩函数
                 compressed_vector, _, _ = self._compression.compress(tensor, name, step=self._num_steps)
                 # 写入压缩专用 buffer
-                group_idx, start, end = self._compressed_param_offsets[name]
+                group_idx, start, end = compressed_offsets[name]
 
                 with torch.no_grad():
-                    pad_buf = self._compressed_pad_buffers[group_idx]
+                    pad_buf = compressed_pad_buffers[group_idx]
 
                     # 重要：写入时使用 compressed_vector 的实际大小，而不是 end-start
                     # 因为 P 和 Q 的长度可能不一致，我们 buffer 是按 max 分配的
                     actual_end = start + compressed_vector.numel()
                     # print(f"name={name}, compressed_vector size={compressed_vector.numel()}, buf slot size={end-start}")
                     pad_buf[start:actual_end].copy_(compressed_vector.view(-1))
+                    if actual_end < end:
+                        pad_buf[actual_end:end].zero_()
                     # 标记 flag（复用原有 flag 机制）
                     # 这里没有和（原有逻辑）一样： 调用pad_grad，而是自己复现了（如果一个组的flag都ok了，说明整个通信组才可以触发通信）
                     _, sub_idx, _, _ = self._param_group_idx[name]
@@ -357,8 +402,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     comm_name = 'reduceScatter-group-%d' % group_idx
                     reduce_scatter_comm.collective_async_(
                         comm_name,
-                        self._compressed_pad_buffers[group_idx],
-                        self._compressed_shard_buffers[group_idx]
+                        compressed_pad_buffers[group_idx],
+                        compressed_shard_buffers[group_idx]
                     )
             else:
                 # 原有逻辑，push_to_buffer函数满了，才会返回pad_grad != None
@@ -444,8 +489,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         for p in self._module_direct_parameters[module_name]:
             name = self._param_names.get(p)
 
-            if self._compression and self._num_steps > self._compression.warmup_steps + 1: # +1 因为此时step+1了
-                _, start, end = self._compressed_param_offsets[name]
+            if self._active_compression_factor is not None:
+                compressed_offsets = self._compression_offsets_for_factor(self._active_compression_factor)
+                compressed_pad_buffers, _ = self._compression_buffers_for_factor(self._active_compression_factor)
+                _, start, end = compressed_offsets[name]
                 # 判断逻辑要与 compress 严格一致
                 use_low_rank = True
                 if hasattr(self._compression, 'should_compress_tensor'):
@@ -454,24 +501,25 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     use_low_rank = p.ndimension() > 1
 
                 if use_low_rank:
-                    # 矩阵：根据 step 偏移决定取 P 还是 Q.在 PowerSGD 中，P 和 Q 维度不同。我们需要知道当前这一步对应的向量到底占了多少长度。
-                    n, m = p.shape[0], p.view(p.shape[0], -1).shape[1]
-
-                    # TODO 目前的问题就是这里查到的rank不对，找出rank的查询路线，就能改正了
-                    rank_c = self._compression.get_rank_for(name, p.shape) # 根据key
-                    # 根据步数计算当前收到的数据长度
-                    # 同样逻辑：如果当前 step 是奇数，说明 Buffer 里存的是上一步传的 P
-                    if self._num_steps % 2 != 0:
-                        curr_size = n * rank_c
-                    else:
-                        curr_size = m * rank_c
+                    rank_c = self._compression.get_rank_for(name, p.shape)
+                    curr_size = self._compression.get_factor_numel(
+                        p.shape,
+                        name=name,
+                        factor_kind=self._active_compression_factor,
+                        rank=rank_c,
+                    )
                 else:
                 # 一维向量或较小向量：直接取全部
                     curr_size = p.numel()
                 
-                compressed_vector = self._compressed_pad_buffers[group_idx][start:start + curr_size]
+                compressed_vector = compressed_pad_buffers[group_idx][start:start + curr_size]
                 grad = self._compression.decompress(
-                    compressed_vector, p.size(), p.numel(), name, step=self._num_steps
+                    compressed_vector,
+                    p.size(),
+                    p.numel(),
+                    name,
+                    step=self._num_steps,
+                    factor_kind=self._active_compression_factor,
                 )
             else:
                 group_idx_p, _, start_p, end_p = self._param_group_idx[name]
@@ -610,11 +658,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         pass
     
     def _allgather_one_group(self, group_idx):
-        if self._compression and self._num_steps > self._compression.warmup_steps + 1:  # +1 因为此时step+1了
+        if self._active_compression_factor is not None:
+            compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(
+                self._active_compression_factor
+            )
             all_gather_comm.collective_async_(
                 "allGather-group-%d" % group_idx,
-                self._compressed_pad_buffers[group_idx],
-                self._compressed_shard_buffers[group_idx]
+                compressed_pad_buffers[group_idx],
+                compressed_shard_buffers[group_idx]
             )
         else:
             pad_grad = self._pad_buffers[group_idx]
@@ -639,6 +690,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # 所有RS的同步操作
         reduce_scatter_comm.synchronize()
         # print("Rank %d: Step %d, ReduceScatter time: %.10f sec" % (rank(), self._num_steps, rs_time))
+
+        if self._compression and self._num_steps > self._compression.warmup_steps:
+            self._active_compression_factor = self._compression_factor_kind(self._num_steps)
+        else:
+            self._active_compression_factor = None
         
         # 第一次调用AG 立即调用group0的AG通信
         self._allgather_one_group(group_idx=0)
