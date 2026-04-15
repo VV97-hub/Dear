@@ -559,98 +559,109 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._sgd(p)
     """
     
-    # 手写 SGD（weight decay / momentum / nesterov）
+    def _to_scalar_value(self, value):
+        if torch.is_tensor(value):
+            return value.item()
+        return value
+
+    def _sgd_param_update(self, p, grad, group):
+        weight_decay = self._to_scalar_value(group.get('weight_decay', 0.0))
+        momentum = self._to_scalar_value(group.get('momentum', 0.0))
+        dampening = self._to_scalar_value(group.get('dampening', 0.0))
+        nesterov = group.get('nesterov', False)
+        maximize = group.get('maximize', False)
+        lr = self._to_scalar_value(group['lr'])
+
+        d_p = grad if not maximize else -grad
+
+        if weight_decay != 0:
+            d_p = d_p.add(p, alpha=weight_decay)
+
+        if momentum != 0:
+            state = self.state[p]
+            buf = state.get('momentum_buffer')
+            if buf is None:
+                buf = d_p.detach().clone()
+                state['momentum_buffer'] = buf
+            else:
+                buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+
+            if nesterov:
+                d_p = d_p.add(buf, alpha=momentum)
+            else:
+                d_p = buf
+
+        p.add_(d_p, alpha=-lr)
+
+    def _adam_param_update(self, p, grad, group):
+        lr = self._to_scalar_value(group['lr'])
+        beta1, beta2 = group['betas']
+        beta1 = self._to_scalar_value(beta1)
+        beta2 = self._to_scalar_value(beta2)
+        eps = self._to_scalar_value(group['eps'])
+        weight_decay = self._to_scalar_value(group.get('weight_decay', 0.0))
+        maximize = group.get('maximize', False)
+        amsgrad = group.get('amsgrad', False)
+        decoupled_weight_decay = group.get('decoupled_weight_decay', False)
+
+        grad = grad if not maximize else -grad
+        state = self.state[p]
+
+        if len(state) == 0:
+            state['step'] = 0
+            state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            if amsgrad:
+                state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+        exp_avg = state['exp_avg']
+        exp_avg_sq = state['exp_avg_sq']
+
+        state['step'] += 1
+        step = state['step']
+
+        if weight_decay != 0:
+            if decoupled_weight_decay:
+                p.mul_(1 - lr * weight_decay)
+            else:
+                grad = grad.add(p, alpha=weight_decay)
+
+        exp_avg.lerp_(grad, 1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+        bias_correction1 = 1 - beta1 ** step
+        bias_correction2 = 1 - beta2 ** step
+        step_size = lr / bias_correction1
+        bias_correction2_sqrt = bias_correction2 ** 0.5
+
+        if amsgrad:
+            max_exp_avg_sq = state['max_exp_avg_sq']
+            torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+            denom = (max_exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+        else:
+            denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+
+        p.addcdiv_(exp_avg, denom, value=-step_size)
+
+    # 手写局部参数更新，但数值路径尽量贴近 PyTorch 官方单张量实现
     def _sgd(self, p, grad):
-        # ✅ 优先用传入的 grad，兜底用 p.grad SHAN
         if grad is None:
             grad = p.grad
         if grad is None:
             return
-        """
-        if p.grad is None:
-            return
-        """
 
-        # 🔹 打印参数 id，用于检查每个参数只被更新一次
-        # print(f"_sgd called for param id={id(p)}, name={self._param_names.get(p)}")
+        group = self.param_to_group[p]
 
-        group = self.param_to_group[p]   # ✅ 修正后的 group 获取方式
+        with torch.no_grad():
+            if 'momentum' in group:
+                self._sgd_param_update(p, grad, group)
+            elif 'betas' in group:
+                self._adam_param_update(p, grad, group)
+            else:
+                raise NotImplementedError(
+                    "Dear local optimizer path currently supports SGD-family and Adam/AdamW-family groups only."
+                )
 
-        if 'momentum' in group:
-            # ===== SGD =====
-            weight_decay = group['weight_decay']
-            momentum = group['momentum']
-            dampening = group['dampening']
-            nesterov = group['nesterov']
-            lr = group['lr']
-
-            d_p = grad
-
-            with torch.no_grad():
-                if weight_decay != 0:
-                    d_p = d_p.add(p, alpha=weight_decay)
-
-                if momentum > 0:
-                    param_state = self.state[p]
-                    if 'momentum_buffer' not in param_state:
-                        buf = torch.zeros_like(p)
-                        param_state['momentum_buffer'] = buf
-                        buf.copy_(d_p)
-                    else:
-                        buf = param_state['momentum_buffer']
-                        buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
-
-                    if nesterov:
-                        d_p = d_p.add(buf, alpha=momentum)
-                    else:
-                        d_p = buf
-
-                p.add_(d_p, alpha=-lr)
-
-        else:
-            # ===== AdamW =====
-            lr = group['lr']
-            beta1, beta2 = group['betas']
-            eps = group['eps']
-            weight_decay = group['weight_decay']
-
-            state = self.state[p]
-
-            if len(state) == 0:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-
-            exp_avg = state['exp_avg']
-            exp_avg_sq = state['exp_avg_sq']
-
-            state['step'] += 1
-            step_n = state['step']
-
-            grad = grad
-
-            with torch.no_grad():
-                if weight_decay != 0:
-                    p.mul_(1 - lr * weight_decay)
-
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                exp_avg_sq.clamp_(min=0.0)          # 新增：防止数值误差产生负数
-                    
-                bias_correction1 = 1 - beta1 ** step_n
-                bias_correction2 = 1 - beta2 ** step_n
-
-                step_size = lr * (bias_correction2 ** 0.5) / bias_correction1
-
-                """ 原本写法
-                denom = exp_avg_sq.sqrt().add_(eps)
-                p.addcdiv_(exp_avg, denom, value=-step_size)
-                """
-
-                denom = exp_avg_sq.sqrt().add(eps)   # 非原地，去掉 clamp
-                update = exp_avg / denom
-                p.add_(update, alpha=-step_size)
-                                
         # 清梯度
         p.grad = None
 
