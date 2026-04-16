@@ -1,4 +1,3 @@
-
 """本备份是一轮传p一轮传q的powersgd的备份2026/4/2，下一步打算试试一轮内同时传p和q的powersgd"""
 # -*- coding: utf-8 -*-"""
 # Copyright 2020 HKBU. All Rights Reserved.
@@ -54,6 +53,256 @@ def init():
 
 DEBUG = False
 
+
+class OverlapProfiler(object):
+    def __init__(self, enabled=False, rank_id=0, log_every=10, warmup_steps=0, output_path='', console_enabled=True):
+        self.enabled = enabled
+        self.rank_id = rank_id
+        self.log_every = max(1, int(log_every))
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.output_path = output_path
+        self.console_enabled = console_enabled
+        self.current = None
+        self.pending = None
+        self.pending_forward = self._new_pending_forward()
+        self.completed = []
+        if self.output_path and self.rank_id == 0:
+            with open(self.output_path, 'w') as f:
+                f.write('')
+
+    def _new_pending_forward(self):
+        return {
+            'ag_wait_s': 0.0,
+            'ag_wait_calls': 0,
+            'update_s': 0.0,
+            'update_calls': 0,
+            'ag_launches': 0,
+        }
+
+    def _new_record(self, step):
+        return {
+            'step': int(step),
+            'forward_total_s': 0.0,
+            'forward_compute_only_est_s': 0.0,
+            'backward_total_s': 0.0,
+            'rs_launches': 0,
+            'rs_first_launch_ts': None,
+            'rs_last_launch_ts': None,
+            'rs_comm_window_s': 0.0,
+            'rs_overlap_with_backward_s': 0.0,
+            'rs_tail_wait_s': 0.0,
+            'ag_wait_s': 0.0,
+            'ag_wait_calls': 0,
+            'update_s': 0.0,
+            'update_calls': 0,
+            'ag_launches': 0,
+            'backward_start_ts': None,
+            'backward_end_ts': None,
+        }
+
+    def begin_step(self, step):
+        if not self.enabled:
+            return
+        if self.current is None:
+            self.current = self._new_record(step)
+
+    def note_forward_total(self, duration_s, step):
+        if not self.enabled:
+            return
+        pending_ag = self.pending_forward['ag_wait_s']
+        pending_update = self.pending_forward['update_s']
+        if self.pending is not None:
+            self.pending['ag_wait_s'] = pending_ag
+            self.pending['ag_wait_calls'] = self.pending_forward['ag_wait_calls']
+            self.pending['update_s'] = pending_update
+            self.pending['update_calls'] = self.pending_forward['update_calls']
+            self.pending['ag_launches'] += self.pending_forward['ag_launches']
+            self._finalize_pending()
+        self.pending_forward = self._new_pending_forward()
+        if self.current is None:
+            self.current = self._new_record(step)
+        self.current['forward_total_s'] = float(duration_s)
+        self.current['forward_compute_only_est_s'] = max(
+            0.0, float(duration_s) - pending_ag - pending_update
+        )
+
+    def note_backward_start(self):
+        if not self.enabled or self.current is None:
+            return
+        self.current['backward_start_ts'] = time.perf_counter()
+
+    def note_backward_total(self, duration_s):
+        if not self.enabled or self.current is None:
+            return
+        self.current['backward_total_s'] = float(duration_s)
+        self.current['backward_end_ts'] = time.perf_counter()
+
+    def note_rs_launch(self):
+        if not self.enabled or self.current is None:
+            return
+        now = time.perf_counter()
+        self.current['rs_launches'] += 1
+        if self.current['rs_first_launch_ts'] is None:
+            self.current['rs_first_launch_ts'] = now
+        self.current['rs_last_launch_ts'] = now
+
+    def note_rs_sync(self, wait_s):
+        if not self.enabled or self.current is None:
+            return
+        end_ts = time.perf_counter()
+        start_ts = end_ts - float(wait_s)
+        if self.current['rs_first_launch_ts'] is not None:
+            self.current['rs_comm_window_s'] = max(
+                0.0, end_ts - self.current['rs_first_launch_ts']
+            )
+        if self.current['backward_end_ts'] is not None:
+            self.current['rs_tail_wait_s'] = max(
+                0.0, end_ts - self.current['backward_end_ts']
+            )
+        if (
+            self.current['backward_end_ts'] is not None
+            and self.current['rs_first_launch_ts'] is not None
+        ):
+            overlap_end = min(self.current['backward_end_ts'], end_ts)
+            overlap_start = min(overlap_end, self.current['rs_first_launch_ts'])
+            self.current['rs_overlap_with_backward_s'] = max(
+                0.0, overlap_end - overlap_start
+            )
+
+    def note_ag_wait(self, duration_s):
+        if not self.enabled or self.pending is None:
+            return
+        self.pending_forward['ag_wait_s'] += float(duration_s)
+        self.pending_forward['ag_wait_calls'] += 1
+
+    def note_update(self, duration_s):
+        if not self.enabled or self.pending is None:
+            return
+        self.pending_forward['update_s'] += float(duration_s)
+        self.pending_forward['update_calls'] += 1
+
+    def note_ag_launch(self):
+        if not self.enabled:
+            return
+        target = self.current if self.current is not None else self.pending
+        if target is None:
+            return
+        target['ag_launches'] += 1
+
+    def mark_step_pending(self):
+        if not self.enabled or self.current is None:
+            return
+        self.pending = self.current
+        self.current = None
+        self.pending_forward = self._new_pending_forward()
+
+    def _emit_record(self, record):
+        if self.rank_id != 0:
+            return
+        if self.output_path:
+            ordered_keys = [
+                'step', 'forward_total_s', 'forward_compute_only_est_s',
+                'backward_total_s', 'rs_launches', 'rs_comm_window_s',
+                'rs_overlap_with_backward_s', 'rs_tail_wait_s',
+                'ag_launches', 'ag_wait_s', 'ag_wait_calls',
+                'update_s', 'update_calls'
+            ]
+            payload = ','.join(
+                ['%s=%s' % (k, record[k]) for k in ordered_keys]
+            )
+            with open(self.output_path, 'a') as f:
+                f.write(payload + '\n')
+
+    def _print_running_summary(self):
+        valid = [r for r in self.completed if r['step'] >= self.warmup_steps]
+        if (
+            self.rank_id != 0
+            or not self.console_enabled
+            or len(valid) == 0
+            or len(valid) % self.log_every != 0
+        ):
+            return
+        means = self.summary()
+        print(
+            '[OverlapSummary] steps=%d '
+            'forward_total=%.6f forward_compute=%.6f backward_total=%.6f '
+            'rs_window=%.6f rs_overlap=%.6f rs_tail=%.6f '
+            'ag_wait=%.6f update=%.6f'
+            % (
+                means['num_steps'],
+                means['forward_total_s'],
+                means['forward_compute_only_est_s'],
+                means['backward_total_s'],
+                means['rs_comm_window_s'],
+                means['rs_overlap_with_backward_s'],
+                means['rs_tail_wait_s'],
+                means['ag_wait_s'],
+                means['update_s'],
+            ),
+            flush=True,
+        )
+
+    def _finalize_pending(self):
+        if self.pending is None:
+            return
+        record = self.pending
+        self.completed.append(record)
+        self._emit_record(record)
+        self._print_running_summary()
+        self.pending = None
+
+    def summary(self):
+        valid = [r for r in self.completed if r['step'] >= self.warmup_steps]
+        if len(valid) == 0:
+            return {'num_steps': 0}
+        keys = [
+            'forward_total_s',
+            'forward_compute_only_est_s',
+            'backward_total_s',
+            'rs_comm_window_s',
+            'rs_overlap_with_backward_s',
+            'rs_tail_wait_s',
+            'ag_wait_s',
+            'update_s',
+        ]
+        summary = {'num_steps': len(valid)}
+        for key in keys:
+            summary[key] = float(np.mean([r[key] for r in valid]))
+        return summary
+
+    def append_summary(self, summary):
+        if self.rank_id != 0 or not self.output_path or summary.get('num_steps', 0) <= 0:
+            return
+        with open(self.output_path, 'a') as f:
+            f.write(
+                'SUMMARY,steps=%d,forward_total_s=%s,forward_compute_only_est_s=%s,'
+                'backward_total_s=%s,rs_comm_window_s=%s,rs_overlap_with_backward_s=%s,'
+                'rs_tail_wait_s=%s,ag_wait_s=%s,update_s=%s\n'
+                % (
+                    summary['num_steps'],
+                    summary['forward_total_s'],
+                    summary['forward_compute_only_est_s'],
+                    summary['backward_total_s'],
+                    summary['rs_comm_window_s'],
+                    summary['rs_overlap_with_backward_s'],
+                    summary['rs_tail_wait_s'],
+                    summary['ag_wait_s'],
+                    summary['update_s'],
+                )
+            )
+
+    def finalize(self):
+        if not self.enabled:
+            return
+        if self.pending is not None:
+            self.pending['ag_wait_s'] = self.pending_forward['ag_wait_s']
+            self.pending['ag_wait_calls'] = self.pending_forward['ag_wait_calls']
+            self.pending['update_s'] = self.pending_forward['update_s']
+            self.pending['update_calls'] = self.pending_forward['update_calls']
+            self.pending['ag_launches'] += self.pending_forward['ag_launches']
+            self._finalize_pending()
+            self.pending_forward = self._new_pending_forward()
+
 class _DistributedOptimizer(torch.optim.Optimizer):
     def __init__(self, params, model, 
             num_nearby_layers=NUM_NEARBY_LAYERS, 
@@ -75,6 +324,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._grad_accs = []
         self._compression = compression  # 保存为实例属性（压缩新增）
         self._active_compression_factor = None
+        self._overlap_profiler = OverlapProfiler(
+            enabled=os.environ.get('DEAR_OVERLAP_PROFILE', '0') == '1',
+            rank_id=rank(),
+            log_every=os.environ.get('DEAR_OVERLAP_LOG_EVERY', '10'),
+            warmup_steps=os.environ.get('DEAR_OVERLAP_WARMUP', '0'),
+            output_path=os.environ.get('DEAR_OVERLAP_OUTPUT', ''),
+            console_enabled=os.environ.get('DEAR_OVERLAP_CONSOLE', '1') == '1',
+        )
         self.param_to_group = {}
         for group in self.param_groups:
             for p in group['params']:
@@ -292,6 +549,24 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             return self._compressed_pad_buffers_p, self._compressed_shard_buffers_p
         return self._compressed_pad_buffers_q, self._compressed_shard_buffers_q
 
+    def profile_step_begin(self):
+        self._overlap_profiler.begin_step(self._num_steps)
+
+    def profile_forward_done(self, duration_s):
+        self._overlap_profiler.note_forward_total(duration_s, self._num_steps)
+
+    def profile_backward_start(self):
+        self._overlap_profiler.note_backward_start()
+
+    def profile_backward_done(self, duration_s):
+        self._overlap_profiler.note_backward_total(duration_s)
+
+    def profile_summary(self):
+        self._overlap_profiler.finalize()
+        summary = self._overlap_profiler.summary()
+        self._overlap_profiler.append_summary(summary)
+        return summary
+
     def _register_hooks(self):
         """
         Register hooks for both feed-forward and back-propagation. 
@@ -400,6 +675,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                             return
                     # 全部 ready，触发通信（用压缩 buffer）
                     comm_name = 'reduceScatter-group-%d' % group_idx
+                    self._overlap_profiler.note_rs_launch()
                     reduce_scatter_comm.collective_async_(
                         comm_name,
                         compressed_pad_buffers[group_idx],
@@ -409,6 +685,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 # 原有逻辑，push_to_buffer函数满了，才会返回pad_grad != None
                 new_name, pad_grad, shard_grad = self._push_to_buffer(name, tensor)
                 if pad_grad is not None:
+                    self._overlap_profiler.note_rs_launch()
                     reduce_scatter_comm.collective_async_(new_name, pad_grad, shard_grad)
             return grad # 注意：hook 应该返回处理后的 grad
         return hook
@@ -469,7 +746,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             if sub_idx == 0 and self._module_group_flags[group_idx] == 0:
                 
                 # 等待上一组AG同步完成（Group0的AG是由step函数发起的）
+                ag_wait_start = time.perf_counter()
                 all_gather_comm.synchronize()
+                self._overlap_profiler.note_ag_wait(time.perf_counter() - ag_wait_start)
                 # torch.cuda.synchronize() 
                 # torch.cuda.current_stream().synchronize()
                 # print("Rank %d: Step %d, AllGather group %d time: %.10f sec" % (rank(), self._num_steps, group_idx, ag_time))
@@ -485,6 +764,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
         torch.cuda.synchronize()
+        update_start = time.perf_counter()
         # -------------------------------------------------------上面的代码加上之后 compress不报NaN-------------------------------------------------------
         for p in self._module_direct_parameters[module_name]:
             name = self._param_names.get(p)
@@ -530,6 +810,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             grad.div_(size())             # ✅ 在局部变量上做，不碰 p.grad
             
             self._sgd(p,grad)
+        self._overlap_profiler.note_update(time.perf_counter() - update_start)
 
     """ 上面改为了压缩版
     def _update_one_module(self, module, module_name, group_idx):
@@ -559,109 +840,98 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._sgd(p)
     """
     
-    def _to_scalar_value(self, value):
-        if torch.is_tensor(value):
-            return value.item()
-        return value
-
-    def _sgd_param_update(self, p, grad, group):
-        weight_decay = self._to_scalar_value(group.get('weight_decay', 0.0))
-        momentum = self._to_scalar_value(group.get('momentum', 0.0))
-        dampening = self._to_scalar_value(group.get('dampening', 0.0))
-        nesterov = group.get('nesterov', False)
-        maximize = group.get('maximize', False)
-        lr = self._to_scalar_value(group['lr'])
-
-        d_p = grad if not maximize else -grad
-
-        if weight_decay != 0:
-            d_p = d_p.add(p, alpha=weight_decay)
-
-        if momentum != 0:
-            state = self.state[p]
-            buf = state.get('momentum_buffer')
-            if buf is None:
-                buf = d_p.detach().clone()
-                state['momentum_buffer'] = buf
-            else:
-                buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
-
-            if nesterov:
-                d_p = d_p.add(buf, alpha=momentum)
-            else:
-                d_p = buf
-
-        p.add_(d_p, alpha=-lr)
-
-    def _adam_param_update(self, p, grad, group):
-        lr = self._to_scalar_value(group['lr'])
-        beta1, beta2 = group['betas']
-        beta1 = self._to_scalar_value(beta1)
-        beta2 = self._to_scalar_value(beta2)
-        eps = self._to_scalar_value(group['eps'])
-        weight_decay = self._to_scalar_value(group.get('weight_decay', 0.0))
-        maximize = group.get('maximize', False)
-        amsgrad = group.get('amsgrad', False)
-        decoupled_weight_decay = group.get('decoupled_weight_decay', False)
-
-        grad = grad if not maximize else -grad
-        state = self.state[p]
-
-        if len(state) == 0:
-            state['step'] = 0
-            state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            if amsgrad:
-                state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-
-        exp_avg = state['exp_avg']
-        exp_avg_sq = state['exp_avg_sq']
-
-        state['step'] += 1
-        step = state['step']
-
-        if weight_decay != 0:
-            if decoupled_weight_decay:
-                p.mul_(1 - lr * weight_decay)
-            else:
-                grad = grad.add(p, alpha=weight_decay)
-
-        exp_avg.lerp_(grad, 1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-        bias_correction1 = 1 - beta1 ** step
-        bias_correction2 = 1 - beta2 ** step
-        step_size = lr / bias_correction1
-        bias_correction2_sqrt = bias_correction2 ** 0.5
-
-        if amsgrad:
-            max_exp_avg_sq = state['max_exp_avg_sq']
-            torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
-            denom = (max_exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-        else:
-            denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-
-        p.addcdiv_(exp_avg, denom, value=-step_size)
-
-    # 手写局部参数更新，但数值路径尽量贴近 PyTorch 官方单张量实现
+    # 手写 SGD（weight decay / momentum / nesterov）
     def _sgd(self, p, grad):
+        # ✅ 优先用传入的 grad，兜底用 p.grad SHAN
         if grad is None:
             grad = p.grad
         if grad is None:
             return
+        """
+        if p.grad is None:
+            return
+        """
 
-        group = self.param_to_group[p]
+        # 🔹 打印参数 id，用于检查每个参数只被更新一次
+        # print(f"_sgd called for param id={id(p)}, name={self._param_names.get(p)}")
 
-        with torch.no_grad():
-            if 'momentum' in group:
-                self._sgd_param_update(p, grad, group)
-            elif 'betas' in group:
-                self._adam_param_update(p, grad, group)
-            else:
-                raise NotImplementedError(
-                    "Dear local optimizer path currently supports SGD-family and Adam/AdamW-family groups only."
-                )
+        group = self.param_to_group[p]   # ✅ 修正后的 group 获取方式
 
+        if 'momentum' in group:
+            # ===== SGD =====
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+            lr = group['lr']
+
+            d_p = grad
+
+            with torch.no_grad():
+                if weight_decay != 0:
+                    d_p = d_p.add(p, alpha=weight_decay)
+
+                if momentum > 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = torch.zeros_like(p)
+                        param_state['momentum_buffer'] = buf
+                        buf.copy_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+
+                    if nesterov:
+                        d_p = d_p.add(buf, alpha=momentum)
+                    else:
+                        d_p = buf
+
+                p.add_(d_p, alpha=-lr)
+
+        else:
+            # ===== AdamW =====
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            weight_decay = group['weight_decay']
+
+            state = self.state[p]
+
+            if len(state) == 0:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+
+            state['step'] += 1
+            step_n = state['step']
+
+            grad = grad
+
+            with torch.no_grad():
+                if weight_decay != 0:
+                    p.mul_(1 - lr * weight_decay)
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                exp_avg_sq.clamp_(min=0.0)          # 新增：防止数值误差产生负数
+                    
+                bias_correction1 = 1 - beta1 ** step_n
+                bias_correction2 = 1 - beta2 ** step_n
+
+                step_size = lr * (bias_correction2 ** 0.5) / bias_correction1
+
+                """ 原本写法
+                denom = exp_avg_sq.sqrt().add_(eps)
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+                """
+
+                denom = exp_avg_sq.sqrt().add(eps)   # 非原地，去掉 clamp
+                update = exp_avg / denom
+                p.add_(update, alpha=-step_size)
+                                
         # 清梯度
         p.grad = None
 
@@ -669,6 +939,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         pass
     
     def _allgather_one_group(self, group_idx):
+        self._overlap_profiler.note_ag_launch()
         if self._active_compression_factor is not None:
             compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(
                 self._active_compression_factor
@@ -699,7 +970,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         """
         # 计时（所有 reduce-scatter 通信 + 被 overlap 剩下的尾巴）  = RS_total_time − backward_overlap_time
         # 所有RS的同步操作
+        rs_sync_start = time.perf_counter()
         reduce_scatter_comm.synchronize()
+        self._overlap_profiler.note_rs_sync(time.perf_counter() - rs_sync_start)
         # print("Rank %d: Step %d, ReduceScatter time: %.10f sec" % (rank(), self._num_steps, rs_time))
 
         if self._compression and self._num_steps > self._compression.warmup_steps:
@@ -727,6 +1000,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         #else:
         #    todo: step with non-distributed optimzier
         # Note: the last step is skipped
+        self._overlap_profiler.mark_step_pending()
         self._num_steps += 1
 
         #test_tensor = torch.tensor([rank()]).cuda()
