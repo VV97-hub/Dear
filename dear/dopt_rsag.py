@@ -990,7 +990,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     
     def _update_one_module(self, module, module_name, group_idx):
         profile_enabled = self._overlap_profiler.enabled
-        if profile_enabled and torch.cuda.is_available():
+        strict_sync_enabled = os.environ.get('DEAR_OVERLAP_NEEDS_SYNC', '0') == '1'
+        if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
             torch.cuda.synchronize()
         update_start = time.perf_counter()
         for p in self._module_direct_parameters[module_name]:
@@ -1037,7 +1038,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             grad.div_(size())             # ✅ 在局部变量上做，不碰 p.grad
             
             self._sgd(p,grad)
-        if profile_enabled and torch.cuda.is_available():
+        if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
             torch.cuda.synchronize()
         update_end = time.perf_counter()
         self._overlap_profiler.note_update(

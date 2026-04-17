@@ -75,6 +75,12 @@ parser.add_argument('--overlap-summary', action='store_true', default=False,
                     help='enable overlap summary statistics output')
 parser.add_argument('--overlap-timeline', action='store_true', default=False,
                     help='enable detailed overlap timeline jsonl output')
+parser.add_argument('--overlap-summary-mode', type=str, default='strict',
+                    choices=['strict', 'light'],
+                    help='summary measurement mode: strict uses extra synchronize, light avoids extra synchronize')
+parser.add_argument('--overlap-timeline-mode', type=str, default='light',
+                    choices=['light', 'strict'],
+                    help='timeline measurement mode: light avoids extra synchronize, strict uses extra synchronize')
 parser.add_argument('--overlap-log-every', type=int, default=10,
                     help='print overlap running average every N completed steps')
 parser.add_argument('--overlap-warmup', type=int, default=0,
@@ -101,10 +107,15 @@ args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 args.overlap_summary = args.overlap_summary or args.overlap_profile
 overlap_enabled = args.overlap_summary or args.overlap_timeline
+overlap_needs_sync = (
+    (args.overlap_summary and args.overlap_summary_mode == 'strict') or
+    (args.overlap_timeline and args.overlap_timeline_mode == 'strict')
+)
 os.environ['HOROVOD_NUM_NCCL_STREAMS'] = str(args.nstreams)
 os.environ['DEAR_OVERLAP_PROFILE'] = '1' if overlap_enabled else '0'
 os.environ['DEAR_OVERLAP_SUMMARY'] = '1' if args.overlap_summary else '0'
 os.environ['DEAR_OVERLAP_TIMELINE'] = '1' if args.overlap_timeline else '0'
+os.environ['DEAR_OVERLAP_NEEDS_SYNC'] = '1' if overlap_needs_sync else '0'
 os.environ['DEAR_OVERLAP_LOG_EVERY'] = str(args.overlap_log_every)
 os.environ['DEAR_OVERLAP_WARMUP'] = str(args.overlap_warmup)
 os.environ['DEAR_OVERLAP_OUTPUT'] = args.overlap_output
@@ -541,36 +552,36 @@ def benchmark_step():
     if args.compressor != 'none':
         _adjust_lr(step)
 
-    if args.overlap_profile and hasattr(optimizer, 'profile_step_begin'):
+    if overlap_enabled and hasattr(optimizer, 'profile_step_begin'):
         optimizer.profile_step_begin()
     optimizer.zero_grad()
 
     # 测试NaN的来源 SHAN with torch.autograd.detect_anomaly():
-    if args.overlap_profile and args.cuda:
+    if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     forward_start = time.perf_counter()
     outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_masks)
     prediction_scores = outputs.prediction_logits
     seq_relationship_score = outputs.seq_relationship_logits
     loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_label)
-    if args.overlap_profile and args.cuda:
+    if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    if args.overlap_profile and hasattr(optimizer, 'profile_forward_done'):
+    if overlap_enabled and hasattr(optimizer, 'profile_forward_done'):
         optimizer.profile_forward_done(time.perf_counter() - forward_start)
 
     if hvd.rank() == 0 and step % 5 == 0:
         print("step:",step)
         print(f"Loss: {loss.item():.4f}")
 
-    if args.overlap_profile and hasattr(optimizer, 'profile_backward_start'):
+    if overlap_enabled and hasattr(optimizer, 'profile_backward_start'):
         optimizer.profile_backward_start()
-    if args.overlap_profile and args.cuda:
+    if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     backward_start = time.perf_counter()
     loss.backward()
-    if args.overlap_profile and args.cuda:
+    if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    if args.overlap_profile and hasattr(optimizer, 'profile_backward_done'):
+    if overlap_enabled and hasattr(optimizer, 'profile_backward_done'):
         optimizer.profile_backward_done(time.perf_counter() - backward_start)
     
     optimizer.step()
@@ -625,7 +636,7 @@ log('Sen/sec per %s: %.1f +-%.1f' % ('GPU', img_sec_mean, img_sec_conf))
 log('Total sen/sec on %d %s(s): %.1f +-%.1f' %
     (hvd.size(), 'GPU', hvd.size() * img_sec_mean, hvd.size() * img_sec_conf))
 
-if args.overlap_profile and hasattr(optimizer, 'profile_summary'):
+if overlap_enabled and hasattr(optimizer, 'profile_summary'):
     overlap_summary = optimizer.profile_summary()
     if hvd.rank() == 0 and args.overlap_console and overlap_summary.get('num_steps', 0) > 0:
         log(

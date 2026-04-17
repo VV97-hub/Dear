@@ -14,6 +14,8 @@ exclude_parts="${exclude_parts:-''}"
 overlap_profile="${overlap_profile:-1}"
 overlap_summary="${overlap_summary:-1}"
 overlap_timeline="${overlap_timeline:-0}"
+overlap_summary_mode="${overlap_summary_mode:-strict}"
+overlap_timeline_mode="${overlap_timeline_mode:-light}"
 overlap_console="${overlap_console:-0}"
 overlap_log_every="${overlap_log_every:-10}"
 overlap_warmup="${overlap_warmup:-0}"
@@ -102,11 +104,12 @@ fi
 if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
     if [ "$overlap_profile" = "1" ]; then
+        benchfile="$benchfile --overlap-profile"
         if [ "$overlap_summary" = "1" ]; then
-            benchfile="$benchfile --overlap-summary --overlap-output $overlap_output"
+            benchfile="$benchfile --overlap-summary --overlap-summary-mode $overlap_summary_mode --overlap-output $overlap_output"
         fi
         if [ "$overlap_timeline" = "1" ]; then
-            benchfile="$benchfile --overlap-timeline --overlap-timeline-output $overlap_timeline_output"
+            benchfile="$benchfile --overlap-timeline --overlap-timeline-mode $overlap_timeline_mode --overlap-timeline-output $overlap_timeline_output"
         fi
         benchfile="$benchfile --overlap-console $overlap_console --overlap-log-every $overlap_log_every --overlap-warmup $overlap_warmup"
     fi
@@ -117,6 +120,8 @@ fi
 if [ "$overlap_profile" = "1" ]; then
     echo "Overlap summary enabled: $overlap_summary"
     echo "Overlap timeline enabled: $overlap_timeline"
+    echo "Overlap summary mode: $overlap_summary_mode"
+    echo "Overlap timeline mode: $overlap_timeline_mode"
     if [ "$overlap_summary" = "1" ]; then
         echo "Overlap timing file: $overlap_output"
     fi
