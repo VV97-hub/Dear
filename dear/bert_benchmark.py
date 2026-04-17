@@ -105,7 +105,6 @@ parser.add_argument('--local-rank', type=int, default=0)
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-args.overlap_summary = args.overlap_summary or args.overlap_profile
 overlap_enabled = args.overlap_summary or args.overlap_timeline
 overlap_needs_sync = (
     (args.overlap_summary and args.overlap_summary_mode == 'strict') or
