@@ -90,11 +90,13 @@ class OverlapProfiler(object):
             'update_intervals': [],
             'ag_launches': 0,
             'ag_last_sync_end_ts': None,
+            'ag_first_update_start_ts': None,
         }
 
     def _new_record(self, step):
         return {
             'step': int(step),
+            'forward_step': None,
             'forward_total_s': 0.0,
             'forward_compute_only_est_s': 0.0,
             'ag_comm_window_s': 0.0,
@@ -103,10 +105,13 @@ class OverlapProfiler(object):
             'rs_launches': 0,
             'rs_first_launch_ts': None,
             'rs_last_launch_ts': None,
+            'rs_sync_end_ts': None,
             'rs_comm_window_s': 0.0,
             'rs_overlap_with_backward_s': 0.0,
             'rs_tail_wait_s': 0.0,
             'ag_first_launch_ts': None,
+            'ag_last_sync_end_ts': None,
+            'ag_first_update_start_ts': None,
             'ag_wait_s': 0.0,
             'ag_wait_calls': 0,
             'update_s': 0.0,
@@ -156,38 +161,38 @@ class OverlapProfiler(object):
     def note_forward_total(self, duration_s, step):
         if not self.enabled:
             return
-        pending_ag = self.pending_forward['ag_wait_s']
-        pending_update = self.pending_forward['update_s']
         forward_end_ts = time.perf_counter()
         forward_start_ts = forward_end_ts - float(duration_s)
         if self.pending is not None:
+            pending_ag = self.pending_forward['ag_wait_s']
+            pending_update = self.pending_forward['update_s']
+            self.pending['forward_step'] = int(step)
+            self.pending['forward_total_s'] = float(duration_s)
+            self.pending['forward_start_ts'] = forward_start_ts
+            self.pending['forward_end_ts'] = forward_end_ts
             self.pending['ag_wait_s'] = pending_ag
             self.pending['ag_wait_calls'] = self.pending_forward['ag_wait_calls']
             self.pending['update_s'] = pending_update
             self.pending['update_calls'] = self.pending_forward['update_calls']
-            self.pending['ag_launches'] += self.pending_forward['ag_launches']
+            self.pending['ag_last_sync_end_ts'] = self.pending_forward['ag_last_sync_end_ts']
+            self.pending['ag_first_update_start_ts'] = self.pending_forward['ag_first_update_start_ts']
+            self._append_event(
+                self.pending,
+                event_type='forward_total',
+                start_ts=forward_start_ts,
+                end_ts=forward_end_ts,
+            )
+            self.pending['forward_compute_only_est_s'] = max(
+                0.0, float(duration_s) - pending_ag - pending_update
+            )
+            self.pending['ag_comm_window_s'] = self._compute_ag_comm_window_s(
+                forward_start_ts, forward_end_ts
+            )
+            self.pending['ag_overlap_with_forward_compute_s'] = self._compute_ag_overlap_with_forward_compute_s(
+                forward_start_ts, forward_end_ts
+            )
             self._finalize_pending()
-        self.pending_forward = self._new_pending_forward()
-        if self.current is None:
-            self.current = self._new_record(step)
-        self.current['forward_total_s'] = float(duration_s)
-        self.current['forward_start_ts'] = forward_start_ts
-        self.current['forward_end_ts'] = forward_end_ts
-        self._append_event(
-            self.current,
-            event_type='forward_total',
-            start_ts=forward_start_ts,
-            end_ts=forward_end_ts,
-        )
-        self.current['forward_compute_only_est_s'] = max(
-            0.0, float(duration_s) - pending_ag - pending_update
-        )
-        self.current['ag_comm_window_s'] = self._compute_ag_comm_window_s(
-            forward_start_ts, forward_end_ts
-        )
-        self.current['ag_overlap_with_forward_compute_s'] = self._compute_ag_overlap_with_forward_compute_s(
-            forward_start_ts, forward_end_ts
-        )
+            self.pending_forward = self._new_pending_forward()
 
     def note_backward_start(self):
         if not self.enabled or self.current is None:
@@ -229,6 +234,7 @@ class OverlapProfiler(object):
             return
         end_ts = time.perf_counter()
         start_ts = end_ts - float(wait_s)
+        self.current['rs_sync_end_ts'] = end_ts
         if self.current['rs_first_launch_ts'] is not None:
             self.current['rs_comm_window_s'] = max(
                 0.0, end_ts - self.current['rs_first_launch_ts']
@@ -287,6 +293,8 @@ class OverlapProfiler(object):
         if end_ts is None:
             end_ts = time.perf_counter()
         start_ts = end_ts - float(duration_s)
+        if self.pending_forward['ag_first_update_start_ts'] is None:
+            self.pending_forward['ag_first_update_start_ts'] = start_ts
         self.pending_forward['update_s'] += float(duration_s)
         self.pending_forward['update_calls'] += 1
         self.pending_forward['update_intervals'].append((start_ts, end_ts))
@@ -302,7 +310,7 @@ class OverlapProfiler(object):
     def note_ag_launch(self, group_idx=None):
         if not self.enabled:
             return
-        target = self.current if self.current is not None else self.pending
+        target = self.pending if self.pending is not None else self.current
         if target is None:
             return
         now = time.perf_counter()
@@ -381,7 +389,7 @@ class OverlapProfiler(object):
         self._emit_ag_group_events(record)
         if self.summary_enabled and self.output_path:
             ordered_keys = [
-                'step', 'forward_total_s', 'forward_compute_only_est_s',
+                'step', 'forward_step', 'forward_total_s', 'forward_compute_only_est_s',
                 'ag_comm_window_s', 'ag_overlap_with_forward_compute_s',
                 'backward_total_s', 'rs_launches', 'rs_comm_window_s',
                 'rs_overlap_with_backward_s', 'rs_tail_wait_s',
@@ -394,17 +402,74 @@ class OverlapProfiler(object):
             with open(self.output_path, 'a') as f:
                 f.write(payload + '\n')
         if self.timeline_enabled and self.timeline_output_path:
-            step_start_ts = record.get('step_start_ts')
+            backward_phase_start_ts = record.get('backward_start_ts')
+            backward_phase_end_ts = record.get('backward_end_ts')
+            forward_phase_start_ts = record.get('forward_start_ts')
+            forward_phase_end_ts = record.get('forward_end_ts')
+            rs_phase_start_ts = record.get('rs_first_launch_ts')
+            rs_phase_end_ts = record.get('rs_sync_end_ts')
+            ag_phase_start_ts = record.get('ag_first_launch_ts')
+            ag_phase_end_ts = record.get('ag_last_sync_end_ts')
+            ag_update_ready_ts = record.get('ag_first_update_start_ts')
+            if ag_update_ready_ts is None:
+                ag_update_ready_ts = ag_phase_end_ts
+
+            cycle_start_ts = backward_phase_start_ts
+            cycle_end_ts = forward_phase_end_ts
+            if cycle_start_ts is None:
+                cycle_start_ts = rs_phase_start_ts
+            if cycle_end_ts is None:
+                cycle_end_ts = ag_phase_end_ts
+            if cycle_end_ts is None:
+                cycle_end_ts = rs_phase_end_ts
+
             events = []
             for event in record.get('events', []):
                 item = dict(event)
-                if step_start_ts is not None:
-                    item['start_ms'] = (item['start_ts'] - step_start_ts) * 1000.0
-                    item['end_ms'] = (item['end_ts'] - step_start_ts) * 1000.0
+                if cycle_start_ts is not None:
+                    item['start_ms'] = (item['start_ts'] - cycle_start_ts) * 1000.0
+                    item['end_ms'] = (item['end_ts'] - cycle_start_ts) * 1000.0
+                if rs_phase_start_ts is not None:
+                    item['start_ms_from_rs'] = (item['start_ts'] - rs_phase_start_ts) * 1000.0
+                    item['end_ms_from_rs'] = (item['end_ts'] - rs_phase_start_ts) * 1000.0
+                if ag_phase_start_ts is not None:
+                    item['start_ms_from_ag'] = (item['start_ts'] - ag_phase_start_ts) * 1000.0
+                    item['end_ms_from_ag'] = (item['end_ts'] - ag_phase_start_ts) * 1000.0
                 events.append(item)
             timeline_payload = {
-                'step': int(record['step']),
-                'step_start_ts': step_start_ts,
+                'cycle': int(record['step']),
+                'source_step': int(record['step']),
+                'forward_step': None if record.get('forward_step') is None else int(record['forward_step']),
+                'cycle_start_ts': cycle_start_ts,
+                'cycle_end_ts': cycle_end_ts,
+                'backward_phase': {
+                    'start_ts': backward_phase_start_ts,
+                    'end_ts': backward_phase_end_ts,
+                    'total_s': record['backward_total_s'],
+                },
+                'forward_phase': {
+                    'start_ts': forward_phase_start_ts,
+                    'end_ts': forward_phase_end_ts,
+                    'total_s': record['forward_total_s'],
+                    'compute_only_est_s': record['forward_compute_only_est_s'],
+                },
+                'rs_phase': {
+                    'start_ts': rs_phase_start_ts,
+                    'end_ts': rs_phase_end_ts,
+                    'comm_window_s': record['rs_comm_window_s'],
+                    'overlap_with_backward_s': record['rs_overlap_with_backward_s'],
+                    'tail_wait_s': record['rs_tail_wait_s'],
+                },
+                'ag_phase': {
+                    'start_ts': ag_phase_start_ts,
+                    'end_ts': ag_phase_end_ts,
+                    'update_ready_ts': ag_update_ready_ts,
+                    'comm_window_s': record['ag_comm_window_s'],
+                    'overlap_with_forward_compute_s': record['ag_overlap_with_forward_compute_s'],
+                    'wait_s': record['ag_wait_s'],
+                    'update_s': record['update_s'],
+                    'launches': record['ag_launches'],
+                },
                 'summary': {
                     'forward_total_s': record['forward_total_s'],
                     'forward_compute_only_est_s': record['forward_compute_only_est_s'],
@@ -511,12 +576,7 @@ class OverlapProfiler(object):
         if not self.enabled:
             return
         if self.pending is not None:
-            self.pending['ag_wait_s'] = self.pending_forward['ag_wait_s']
-            self.pending['ag_wait_calls'] = self.pending_forward['ag_wait_calls']
-            self.pending['update_s'] = self.pending_forward['update_s']
-            self.pending['update_calls'] = self.pending_forward['update_calls']
-            self.pending['ag_launches'] += self.pending_forward['ag_launches']
-            self._finalize_pending()
+            self.pending = None
             self.pending_forward = self._new_pending_forward()
 
 class _DistributedOptimizer(torch.optim.Optimizer):
