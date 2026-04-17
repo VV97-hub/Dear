@@ -71,12 +71,18 @@ parser.add_argument('--density', type=float, default=1, help='Density for sparsi
 parser.add_argument('--exclude-parts', type=str, default='', help='choices: reducescatter, allgather')
 parser.add_argument('--overlap-profile', action='store_true', default=False,
                     help='profile forward/backward compute and communication overlap')
+parser.add_argument('--overlap-summary', action='store_true', default=False,
+                    help='enable overlap summary statistics output')
+parser.add_argument('--overlap-timeline', action='store_true', default=False,
+                    help='enable detailed overlap timeline jsonl output')
 parser.add_argument('--overlap-log-every', type=int, default=10,
                     help='print overlap running average every N completed steps')
 parser.add_argument('--overlap-warmup', type=int, default=0,
                     help='skip first N profiled steps when averaging')
 parser.add_argument('--overlap-output', type=str, default='',
                     help='optional file path for per-step overlap records')
+parser.add_argument('--overlap-timeline-output', type=str, default='',
+                    help='optional file path for detailed overlap timeline jsonl records')
 parser.add_argument('--overlap-console', type=int, default=1,
                     help='whether to print overlap summary to console: 1 or 0')
 # 动态rank增加：
@@ -93,11 +99,16 @@ parser.add_argument('--local-rank', type=int, default=0)
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
+args.overlap_summary = args.overlap_summary or args.overlap_profile
+overlap_enabled = args.overlap_summary or args.overlap_timeline
 os.environ['HOROVOD_NUM_NCCL_STREAMS'] = str(args.nstreams)
-os.environ['DEAR_OVERLAP_PROFILE'] = '1' if args.overlap_profile else '0'
+os.environ['DEAR_OVERLAP_PROFILE'] = '1' if overlap_enabled else '0'
+os.environ['DEAR_OVERLAP_SUMMARY'] = '1' if args.overlap_summary else '0'
+os.environ['DEAR_OVERLAP_TIMELINE'] = '1' if args.overlap_timeline else '0'
 os.environ['DEAR_OVERLAP_LOG_EVERY'] = str(args.overlap_log_every)
 os.environ['DEAR_OVERLAP_WARMUP'] = str(args.overlap_warmup)
 os.environ['DEAR_OVERLAP_OUTPUT'] = args.overlap_output
+os.environ['DEAR_OVERLAP_TIMELINE_OUTPUT'] = args.overlap_timeline_output
 os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
 
 # rank动态变化预设方案映射
@@ -541,12 +552,12 @@ def benchmark_step():
     outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_masks)
     prediction_scores = outputs.prediction_logits
     seq_relationship_score = outputs.seq_relationship_logits
+    loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_label)
     if args.overlap_profile and args.cuda:
         torch.cuda.synchronize()
     if args.overlap_profile and hasattr(optimizer, 'profile_forward_done'):
         optimizer.profile_forward_done(time.perf_counter() - forward_start)
 
-    loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_label)
     if hvd.rank() == 0 and step % 5 == 0:
         print("step:",step)
         print(f"Loss: {loss.item():.4f}")
@@ -619,13 +630,16 @@ if args.overlap_profile and hasattr(optimizer, 'profile_summary'):
     if hvd.rank() == 0 and args.overlap_console and overlap_summary.get('num_steps', 0) > 0:
         log(
             'Overlap summary: steps=%d, '
-            'forward_total=%.6f s, forward_compute=%.6f s, backward_total=%.6f s, '
+            'forward_total=%.6f s, forward_compute=%.6f s, '
+            'ag_window=%.6f s, ag_overlap=%.6f s, backward_total=%.6f s, '
             'rs_window=%.6f s, rs_overlap=%.6f s, rs_tail=%.6f s, '
             'ag_wait=%.6f s, update=%.6f s'
             % (
                 overlap_summary['num_steps'],
                 overlap_summary['forward_total_s'],
                 overlap_summary['forward_compute_only_est_s'],
+                overlap_summary['ag_comm_window_s'],
+                overlap_summary['ag_overlap_with_forward_compute_s'],
                 overlap_summary['backward_total_s'],
                 overlap_summary['rs_comm_window_s'],
                 overlap_summary['rs_overlap_with_backward_s'],

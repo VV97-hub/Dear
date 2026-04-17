@@ -12,11 +12,14 @@ asc="${asc:-0}"
 threshold="${threshold:-0}"
 exclude_parts="${exclude_parts:-''}"
 overlap_profile="${overlap_profile:-1}"
+overlap_summary="${overlap_summary:-1}"
+overlap_timeline="${overlap_timeline:-0}"
 overlap_console="${overlap_console:-0}"
 overlap_log_every="${overlap_log_every:-10}"
 overlap_warmup="${overlap_warmup:-0}"
 overlap_dir="${overlap_dir:-./overlap_logs}"
 overlap_output="${overlap_output:-}"
+overlap_timeline_output="${overlap_timeline_output:-}"
 source ../configs/envs.conf
 
 ### ----------------------------------------获取节点主机名----------------------------------------
@@ -81,23 +84,45 @@ export NCCL_IB_HCA=mlx5_bond_0
 export NCCL_SOCKET_IFNAME=bond0
 export NCCL_IB_GID_INDEX=3
 
-if [ "$overlap_profile" = "1" ] && [ -z "$overlap_output" ]; then
+if [ "$overlap_profile" = "1" ] && [ "$overlap_summary" = "1" ] && [ -z "$overlap_output" ]; then
     mkdir -p "$overlap_dir"
     overlap_output="${overlap_dir}/overlap_${dnn}_${compressor}_bs${bs}_nw${nworkers}_sl${senlen}_job${SLURM_JOB_ID:-nojob}.log"
+fi
+
+if [ "$overlap_profile" = "1" ] && [ "$overlap_timeline" = "1" ] && [ -z "$overlap_timeline_output" ]; then
+    mkdir -p "$overlap_dir"
+    if [ -n "$overlap_output" ]; then
+        overlap_timeline_output="${overlap_output}.timeline.jsonl"
+    else
+        overlap_timeline_output="${overlap_dir}/overlap_${dnn}_${compressor}_bs${bs}_nw${nworkers}_sl${senlen}_job${SLURM_JOB_ID:-nojob}.timeline.jsonl"
+    fi
 fi
 
 # 前面层层包装起来，cmd{benchfile{选模型}}
 if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
     if [ "$overlap_profile" = "1" ]; then
-        benchfile="$benchfile --overlap-profile --overlap-console $overlap_console --overlap-log-every $overlap_log_every --overlap-warmup $overlap_warmup --overlap-output $overlap_output"
+        if [ "$overlap_summary" = "1" ]; then
+            benchfile="$benchfile --overlap-summary --overlap-output $overlap_output"
+        fi
+        if [ "$overlap_timeline" = "1" ]; then
+            benchfile="$benchfile --overlap-timeline --overlap-timeline-output $overlap_timeline_output"
+        fi
+        benchfile="$benchfile --overlap-console $overlap_console --overlap-log-every $overlap_log_every --overlap-warmup $overlap_warmup"
     fi
 else
     benchfile="imagenet_benchmark.py --model $dnn --exclude-parts $exclude_parts"
 fi
 
 if [ "$overlap_profile" = "1" ]; then
-    echo "Overlap timing file: $overlap_output"
+    echo "Overlap summary enabled: $overlap_summary"
+    echo "Overlap timeline enabled: $overlap_timeline"
+    if [ "$overlap_summary" = "1" ]; then
+        echo "Overlap timing file: $overlap_output"
+    fi
+    if [ "$overlap_timeline" = "1" ]; then
+        echo "Overlap timeline file: $overlap_timeline_output"
+    fi
 fi
 
 if [ "$compressor" = "none" ]; then # 不压缩 TODO压缩是压缩什么内容？貌似compressor要么=none，要么=fp16
