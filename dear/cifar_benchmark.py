@@ -31,14 +31,13 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("--model", type=str, default="cifar10_resnet18", choices=["cifar10_resnet18", "cifar10_vgg16"])
 parser.add_argument("--batch-size", type=int, default=128)
-parser.add_argument("--epochs", type=int, default=200)
+parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--base-lr", type=float, default=0.1)
 parser.add_argument("--momentum", type=float, default=0.9)
 parser.add_argument("--weight-decay", type=float, default=5e-4)
 parser.add_argument("--workers", type=int, default=4)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--data-dir", type=str, default="./cifar10_data")
-parser.add_argument("--download-dataset", action="store_true", default=False)
 parser.add_argument("--print-freq", type=int, default=50)
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--no-cuda", action="store_true", default=False)
@@ -105,25 +104,17 @@ RANK_SCHEDULES = {
 }
 
 
+# 动态rank的config打印
+print("===== Dynamic_rank Training Config =====")
+print(f"compress_rank: {args.compress_rank}")
+print(f"compress_warmup: {args.compress_warmup}")
+print(f"compress_min_numel: {args.compress_min_numel}")
+print(f"rank_schedule: {args.rank_schedule}")
+print("========================================")
+
 def hvd_barrier():
     token = torch.tensor([1.0], device="cuda" if args.cuda else "cpu")
     hvd.allreduce(token, name="cifar10_setup_barrier")
-
-
-def dataset_is_ready(root):
-    base_dir = os.path.join(root, "cifar-10-batches-py")
-    required_files = [
-        "batches.meta",
-        "data_batch_1",
-        "data_batch_2",
-        "data_batch_3",
-        "data_batch_4",
-        "data_batch_5",
-        "test_batch",
-    ]
-    return os.path.isdir(base_dir) and all(
-        os.path.exists(os.path.join(base_dir, name)) for name in required_files
-    )
 
 
 def build_model():
@@ -152,26 +143,9 @@ def build_dataloaders():
         ]
     )
 
-    if not dataset_is_ready(args.data_dir) and not args.download_dataset:
-        raise RuntimeError(
-            "CIFAR-10 dataset not found under '{}'. Expected directory '{}/cifar-10-batches-py'. "
-            "Please place the extracted CIFAR-10 files there, or rerun with --download-dataset."
-            .format(args.data_dir, args.data_dir)
-        )
-
     if hvd.rank() == 0:
-        train_dataset = datasets.CIFAR10(
-            root=args.data_dir,
-            train=True,
-            download=args.download_dataset,
-            transform=train_transform,
-        )
-        test_dataset = datasets.CIFAR10(
-            root=args.data_dir,
-            train=False,
-            download=args.download_dataset,
-            transform=test_transform,
-        )
+        train_dataset = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_transform)
+        test_dataset = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=test_transform)
     else:
         train_dataset = None
         test_dataset = None

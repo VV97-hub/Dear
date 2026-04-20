@@ -3,11 +3,11 @@ nworkers="${nworkers:-4}"
 bs="${bs:-64}"
 # dnn参数选择模型和数据：cifar10_resnet18   cifar10_vgg16 （真实 CIFAR-10 训练任务——ACP测试精度的） 
 # 原本的实验 bert_base /bert ————> 对应bert_benchmark  dnn=resnet18、dnn=vgg16 走的是 /mnt/c/Users/sg564/Desktop/Dear/dear/imagenet_benchmark.py:1，那是合成数据吞吐测试
-dnn="${dnn:-bert_base}"
+dnn="${dnn:-cifar10_resnet18}"
 data_dir="${data_dir:-./cifar10_data}"
 download_dataset="${download_dataset:-0}"
 # compressor的选项none、halfrankk、(topk、eftopk，gaussian，signum，efsignum，)
-compressor="${compressor:-halfrankk}"
+compressor="${compressor:-none}"
 senlen="${senlen:-64}"
 rdma="${rdma:-0}"
 nstreams="${nstreams:-1}"
