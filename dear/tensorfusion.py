@@ -474,9 +474,10 @@ class CommReduceScatter:
 
     def collective_async_(self, name, pad_tensor, shard_tensor):
         self._name_tensors[name] = (pad_tensor, shard_tensor)
-        #current_stream = torch.cuda.current_stream()
-        #current_stream.synchronize()
-        self._current_stream.wait_stream(self._current_stream)
+        # Validation barrier: ensure the compute stream has finished writing the
+        # fusion buffers before NCCL starts reading them on the comm stream.
+        current_stream = torch.cuda.current_stream(device=pad_tensor.device)
+        current_stream.synchronize()
 
         if self.op == CollectiveOp.REDUCE_SCATTER:
             handle = self.merged_comm.reduceScatter(pad_tensor, shard_tensor)
