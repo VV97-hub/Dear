@@ -53,7 +53,7 @@ parser.add_argument('--num-warmup-batches', type=int, default=10,
                     help='number of warm-up batches that don\'t count towards benchmark')
 parser.add_argument('--num-batches-per-iter', type=int, default=10,
                     help='number of batches per benchmark iteration')
-parser.add_argument('--num-iters', type=int, default=2000,
+parser.add_argument('--num-iters', type=int, default=100,
                     help='number of benchmark iterations')
 
 parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -93,7 +93,7 @@ parser.add_argument('--overlap-console', type=int, default=1,
                     help='whether to print overlap summary to console: 1 or 0')
 # 动态rank增加：
 parser.add_argument('--compress-rank', type=int, default=8)
-parser.add_argument('--compress-warmup', type=int, default=1000)
+parser.add_argument('--compress-warmup', type=int, default=500)
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict

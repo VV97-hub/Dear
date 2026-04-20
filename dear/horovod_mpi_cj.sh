@@ -1,6 +1,8 @@
 #!/bin/bash
 nworkers="${nworkers:-4}"
 bs="${bs:-64}"
+# dnn参数选择模型和数据：cifar10_resnet18   cifar10_vgg16 （真实 CIFAR-10 训练任务——ACP测试精度的） 
+# 原本的实验 bert_base /bert ————> 对应bert_benchmark  dnn=resnet18、dnn=vgg16 走的是 /mnt/c/Users/sg564/Desktop/Dear/dear/imagenet_benchmark.py:1，那是合成数据吞吐测试
 dnn="${dnn:-bert_base}"
 # compressor的选项none、halfrankk、(topk、eftopk，gaussian，signum，efsignum，)
 compressor="${compressor:-halfrankk}"
@@ -11,9 +13,9 @@ mgwfbp="${mgwfbp:-0}"
 asc="${asc:-0}"
 threshold="${threshold:-0}"
 exclude_parts="${exclude_parts:-''}"
-overlap_profile="${overlap_profile:-1}"
-overlap_summary="${overlap_summary:-1}"
-overlap_timeline="${overlap_timeline:-0}"
+overlap_profile="${overlap_profile:-0}"
+overlap_summary="${overlap_summary:-0}"
+overlap_timeline="${overlap_timeline:-1}"
 overlap_summary_mode="${overlap_summary_mode:-strict}"
 overlap_timeline_mode="${overlap_timeline_mode:-light}"
 overlap_console="${overlap_console:-0}"
@@ -100,19 +102,28 @@ if [ "$overlap_profile" = "1" ] && [ "$overlap_timeline" = "1" ] && [ -z "$overl
     fi
 fi
 
+append_overlap_args() {
+    local current="$1"
+    if [ "$overlap_profile" = "1" ]; then
+        current="$current --overlap-profile"
+        if [ "$overlap_summary" = "1" ]; then
+            current="$current --overlap-summary --overlap-summary-mode $overlap_summary_mode --overlap-output $overlap_output"
+        fi
+        if [ "$overlap_timeline" = "1" ]; then
+            current="$current --overlap-timeline --overlap-timeline-mode $overlap_timeline_mode --overlap-timeline-output $overlap_timeline_output"
+        fi
+        current="$current --overlap-console $overlap_console --overlap-log-every $overlap_log_every --overlap-warmup $overlap_warmup"
+    fi
+    echo "$current"
+}
+
 # 前面层层包装起来，cmd{benchfile{选模型}}
 if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
-    if [ "$overlap_profile" = "1" ]; then
-        benchfile="$benchfile --overlap-profile"
-        if [ "$overlap_summary" = "1" ]; then
-            benchfile="$benchfile --overlap-summary --overlap-summary-mode $overlap_summary_mode --overlap-output $overlap_output"
-        fi
-        if [ "$overlap_timeline" = "1" ]; then
-            benchfile="$benchfile --overlap-timeline --overlap-timeline-mode $overlap_timeline_mode --overlap-timeline-output $overlap_timeline_output"
-        fi
-        benchfile="$benchfile --overlap-console $overlap_console --overlap-log-every $overlap_log_every --overlap-warmup $overlap_warmup"
-    fi
+    benchfile=$(append_overlap_args "$benchfile")
+elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ]; then
+    benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts"
+    benchfile=$(append_overlap_args "$benchfile")
 else
     benchfile="imagenet_benchmark.py --model $dnn --exclude-parts $exclude_parts"
 fi

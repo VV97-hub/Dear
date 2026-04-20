@@ -1049,6 +1049,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._update_one_module(module, name, group_idx)
     
     def _update_one_module(self, module, module_name, group_idx):
+        # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
+        torch.cuda.synchronize()
+        # -------------------------------------------------------上面的代码加上之后 compress不报NaN-------------------------------------------------------
         profile_enabled = self._overlap_profiler.enabled
         strict_sync_enabled = os.environ.get('DEAR_OVERLAP_NEEDS_SYNC', '0') == '1'
         if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
