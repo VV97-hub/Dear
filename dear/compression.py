@@ -98,8 +98,6 @@ class HalfRankKReducer(Reducer):
         if lower_name.endswith("bias") or ".bias" in lower_name:
             return True
         if "embedding" in lower_name or "embeddings" in lower_name:
-
-            """
             # 让embedding部分参与压缩：
             allowed_embedding_names = {
                 "bert.embeddings.word_embeddings.weight",
@@ -107,9 +105,9 @@ class HalfRankKReducer(Reducer):
             }
             if lower_name not in allowed_embedding_names:
                 return True
-            """
+
             # 不让embedding部分参与压缩：
-            return True
+            # return True
         if "layernorm" in lower_name or "layer_norm" in lower_name:
             return True
         return False

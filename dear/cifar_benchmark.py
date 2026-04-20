@@ -38,6 +38,7 @@ parser.add_argument("--weight-decay", type=float, default=5e-4)
 parser.add_argument("--workers", type=int, default=4)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--data-dir", type=str, default="./cifar10_data")
+parser.add_argument("--download-dataset", action="store_true", default=False)
 parser.add_argument("--print-freq", type=int, default=50)
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--no-cuda", action="store_true", default=False)
@@ -109,6 +110,22 @@ def hvd_barrier():
     hvd.allreduce(token, name="cifar10_setup_barrier")
 
 
+def dataset_is_ready(root):
+    base_dir = os.path.join(root, "cifar-10-batches-py")
+    required_files = [
+        "batches.meta",
+        "data_batch_1",
+        "data_batch_2",
+        "data_batch_3",
+        "data_batch_4",
+        "data_batch_5",
+        "test_batch",
+    ]
+    return os.path.isdir(base_dir) and all(
+        os.path.exists(os.path.join(base_dir, name)) for name in required_files
+    )
+
+
 def build_model():
     if args.model == "cifar10_resnet18":
         return tv_models.resnet18(num_classes=10)
@@ -135,9 +152,26 @@ def build_dataloaders():
         ]
     )
 
+    if not dataset_is_ready(args.data_dir) and not args.download_dataset:
+        raise RuntimeError(
+            "CIFAR-10 dataset not found under '{}'. Expected directory '{}/cifar-10-batches-py'. "
+            "Please place the extracted CIFAR-10 files there, or rerun with --download-dataset."
+            .format(args.data_dir, args.data_dir)
+        )
+
     if hvd.rank() == 0:
-        train_dataset = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_transform)
-        test_dataset = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=test_transform)
+        train_dataset = datasets.CIFAR10(
+            root=args.data_dir,
+            train=True,
+            download=args.download_dataset,
+            transform=train_transform,
+        )
+        test_dataset = datasets.CIFAR10(
+            root=args.data_dir,
+            train=False,
+            download=args.download_dataset,
+            transform=test_transform,
+        )
     else:
         train_dataset = None
         test_dataset = None

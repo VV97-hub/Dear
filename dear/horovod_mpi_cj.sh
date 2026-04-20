@@ -4,6 +4,8 @@ bs="${bs:-64}"
 # dnn参数选择模型和数据：cifar10_resnet18   cifar10_vgg16 （真实 CIFAR-10 训练任务——ACP测试精度的） 
 # 原本的实验 bert_base /bert ————> 对应bert_benchmark  dnn=resnet18、dnn=vgg16 走的是 /mnt/c/Users/sg564/Desktop/Dear/dear/imagenet_benchmark.py:1，那是合成数据吞吐测试
 dnn="${dnn:-bert_base}"
+data_dir="${data_dir:-./cifar10_data}"
+download_dataset="${download_dataset:-0}"
 # compressor的选项none、halfrankk、(topk、eftopk，gaussian，signum，efsignum，)
 compressor="${compressor:-halfrankk}"
 senlen="${senlen:-64}"
@@ -122,7 +124,10 @@ if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
     benchfile=$(append_overlap_args "$benchfile")
 elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ]; then
-    benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts"
+    benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts --data-dir $data_dir"
+    if [ "$download_dataset" = "1" ]; then
+        benchfile="$benchfile --download-dataset"
+    fi
     benchfile=$(append_overlap_args "$benchfile")
 else
     benchfile="imagenet_benchmark.py --model $dnn --exclude-parts $exclude_parts"

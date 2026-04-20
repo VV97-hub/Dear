@@ -922,9 +922,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             # grad.add_(0)
 
             # 加入这个就完全不报错了
-            if torch.isnan(grad).any():
-                print(f"[NaN in hook] step={self._num_steps}, name={name}, "
-                    f"max={grad.abs().max().item():.3e}")
+            # if torch.isnan(grad).any():
+            #     print(f"[NaN in hook] step={self._num_steps}, name={name}, "
+            #        f"max={grad.abs().max().item():.3e}")
             # -------------------------------------------------------上面的代码加上之后 baseline不报NaN-------------------------------------------------------
             tensor = grad   # ✅ 用这个！！！
 
@@ -1050,7 +1050,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         # -------------------------------------------------------上面的代码加上之后 compress不报NaN-------------------------------------------------------
         profile_enabled = self._overlap_profiler.enabled
         strict_sync_enabled = os.environ.get('DEAR_OVERLAP_NEEDS_SYNC', '0') == '1'
