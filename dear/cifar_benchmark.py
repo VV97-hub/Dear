@@ -12,10 +12,10 @@ import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.datasets as datasets
-import torchvision.models as tv_models
 import torchvision.transforms as transforms
 
 import dopt_rsag as hvd
+from cifar_models import cifar_resnet18, cifar_vgg16
 from compression import compressors
 
 
@@ -33,6 +33,9 @@ parser.add_argument("--model", type=str, default="cifar10_resnet18", choices=["c
 parser.add_argument("--batch-size", type=int, default=128)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--base-lr", type=float, default=0.1)
+parser.add_argument("--warmup-epochs", type=int, default=5)
+parser.add_argument("--lr-decay-epochs", type=str, default="150,220")
+parser.add_argument("--lr-decay-factor", type=float, default=0.1)
 parser.add_argument("--momentum", type=float, default=0.9)
 parser.add_argument("--weight-decay", type=float, default=5e-4)
 parser.add_argument("--workers", type=int, default=4)
@@ -65,6 +68,7 @@ parser.add_argument("--compress-warmup", type=int, default=1000)
 parser.add_argument("--compress-min-numel", type=int, default=16384)
 parser.add_argument("--rank-schedule", type=str, default=None, choices=[None, "aggressive", "gentle"])
 args = parser.parse_args()
+args.lr_decay_epochs = [int(epoch) for epoch in args.lr_decay_epochs.split(",") if epoch]
 
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0"))
@@ -119,8 +123,8 @@ def hvd_barrier():
 
 def build_model():
     if args.model == "cifar10_resnet18":
-        return tv_models.resnet18(num_classes=10)
-    return tv_models.vgg16(num_classes=10)
+        return cifar_resnet18(num_classes=10)
+    return cifar_vgg16(num_classes=10)
 
 
 def build_dataloaders():
@@ -184,12 +188,17 @@ def build_dataloaders():
     return train_loader, test_loader, train_sampler
 
 
-def adjust_learning_rate(optimizer, epoch):
-    lr = args.base_lr * hvd.size()
-    if epoch >= 100:
-        lr *= 0.1
-    if epoch >= 150:
-        lr *= 0.1
+def adjust_learning_rate(optimizer, epoch, batch_idx, num_batches):
+    lr = args.base_lr
+
+    if args.warmup_epochs > 0 and hvd.size() > 1 and epoch < args.warmup_epochs:
+        epoch_progress = epoch + float(batch_idx + 1) / num_batches
+        lr *= (epoch_progress * (hvd.size() - 1) / args.warmup_epochs + 1.0) / hvd.size()
+
+    for decay_epoch in args.lr_decay_epochs:
+        if epoch >= decay_epoch:
+            lr *= args.lr_decay_factor
+
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
     return lr
@@ -214,10 +223,12 @@ criterion = nn.CrossEntropyLoss()
 if args.cuda:
     criterion.cuda()
 
-lr_scaler = hvd.size() if not args.use_adasum else 1
+initial_lr = args.base_lr
+if args.warmup_epochs > 0 and hvd.size() > 1:
+    initial_lr = args.base_lr / hvd.size()
 optimizer = optim.SGD(
     model.parameters(),
-    lr=args.base_lr * lr_scaler,
+    lr=initial_lr,
     momentum=args.momentum,
     weight_decay=args.weight_decay,
 )
@@ -254,10 +265,10 @@ train_loader, test_loader, train_sampler = build_dataloaders()
 def train_one_epoch(epoch):
     model.train()
     train_sampler.set_epoch(epoch)
-    lr = adjust_learning_rate(optimizer, epoch)
     running_loss = 0.0
 
     for step, (data, target) in enumerate(train_loader, start=1):
+        lr = adjust_learning_rate(optimizer, epoch, step - 1, len(train_loader))
         if args.cuda:
             data = data.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
@@ -308,12 +319,16 @@ def evaluate(epoch):
 
 
 log(
-    "CIFAR benchmark start model={} compressor={} batch_size={} workers={} world_size={}".format(
+    "CIFAR benchmark start model={} compressor={} batch_size={} workers={} world_size={} base_lr={} warmup_epochs={} decay_epochs={} decay_factor={}".format(
         args.model,
         args.compressor,
         args.batch_size,
         args.workers,
         hvd.size(),
+        args.base_lr,
+        args.warmup_epochs,
+        args.lr_decay_epochs,
+        args.lr_decay_factor,
     )
 )
 for epoch in range(args.epochs):
