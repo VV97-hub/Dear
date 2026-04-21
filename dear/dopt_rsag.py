@@ -145,15 +145,18 @@ class OverlapProfiler(object):
             'module_name': module_name,
         })
 
-    def set_topology(self, module_groups):
+    def set_topology(self, module_groups, group_stats=None):
         if not self.enabled or not self.timeline_enabled or self.rank_id != 0 or not self.timeline_output_path:
             return
+        groups = []
+        for idx, group in enumerate(module_groups):
+            item = {'group_idx': idx, 'modules': list(group)}
+            if group_stats is not None and idx < len(group_stats) and group_stats[idx] is not None:
+                item.update(group_stats[idx])
+            groups.append(item)
         payload = {
             'num_groups': len(module_groups),
-            'groups': [
-                {'group_idx': idx, 'modules': list(group)}
-                for idx, group in enumerate(module_groups)
-            ],
+            'groups': groups,
         }
         with open(self.timeline_output_path + '.meta.json', 'w') as f:
             json.dump(payload, f, indent=2)
@@ -730,9 +733,37 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._num_groups = len(module_groups)
         self._module_group_flags = [0]*len(module_groups) # check whether module group is gathered
         self._param_group_flags = [[0]*len(g) for g in param_groups] # check whether param group is ready
-        self._overlap_profiler.set_topology(
-            [[self._module_names[module] for module in module_group] for module_group in module_groups]
-        )
+        topology_module_groups = [
+            [self._module_names[module] for module in module_group]
+            for module_group in module_groups
+        ]
+        group_stats = []
+        for group_idx, pad_buffer in enumerate(self._pad_buffers):
+            raw_numel = sum(
+                p.data.numel()
+                for module in module_groups[group_idx]
+                for p in self._module_direct_parameters[self._module_names[module]]
+            )
+            group_stats.append({
+                'uncompressed_numel': int(raw_numel),
+                'uncompressed_bytes': int(raw_numel * 4),
+                'uncompressed_mb': float(raw_numel * 4 / 1024 / 1024),
+                'uncompressed_buffer_numel': int(pad_buffer.numel()),
+                'uncompressed_buffer_bytes': int(pad_buffer.numel() * 4),
+                'uncompressed_buffer_mb': float(pad_buffer.numel() * 4 / 1024 / 1024),
+                'compressed_p_numel': None,
+                'compressed_p_bytes': None,
+                'compressed_p_mb': None,
+                'compressed_p_buffer_numel': None,
+                'compressed_p_buffer_bytes': None,
+                'compressed_p_buffer_mb': None,
+                'compressed_q_numel': None,
+                'compressed_q_bytes': None,
+                'compressed_q_mb': None,
+                'compressed_q_buffer_numel': None,
+                'compressed_q_buffer_bytes': None,
+                'compressed_q_buffer_mb': None,
+            })
 
         if rank() == 0: 
             print('#Tensor fusion groups:', len(module_groups))
@@ -803,6 +834,27 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     torch.zeros(total_size + pad_num, device=self._pad_buffers[group_idx].device))
                 self._compressed_shard_buffers_q.append(
                     torch.zeros((total_size + pad_num) // size(), device=self._pad_buffers[group_idx].device))
+
+            for group_idx, total_size in enumerate(compressed_group_sizes_p):
+                group_stats[group_idx].update({
+                    'compressed_p_numel': int(total_size),
+                    'compressed_p_bytes': int(total_size * 4),
+                    'compressed_p_mb': float(total_size * 4 / 1024 / 1024),
+                    'compressed_p_buffer_numel': int(self._compressed_pad_buffers_p[group_idx].numel()),
+                    'compressed_p_buffer_bytes': int(self._compressed_pad_buffers_p[group_idx].numel() * 4),
+                    'compressed_p_buffer_mb': float(self._compressed_pad_buffers_p[group_idx].numel() * 4 / 1024 / 1024),
+                })
+            for group_idx, total_size in enumerate(compressed_group_sizes_q):
+                group_stats[group_idx].update({
+                    'compressed_q_numel': int(total_size),
+                    'compressed_q_bytes': int(total_size * 4),
+                    'compressed_q_mb': float(total_size * 4 / 1024 / 1024),
+                    'compressed_q_buffer_numel': int(self._compressed_pad_buffers_q[group_idx].numel()),
+                    'compressed_q_buffer_bytes': int(self._compressed_pad_buffers_q[group_idx].numel() * 4),
+                    'compressed_q_buffer_mb': float(self._compressed_pad_buffers_q[group_idx].numel() * 4 / 1024 / 1024),
+                })
+
+        self._overlap_profiler.set_topology(topology_module_groups, group_stats=group_stats)
         
     @torch.no_grad()
     def _get_pad_tensor(self, tensor, numel, size): 
