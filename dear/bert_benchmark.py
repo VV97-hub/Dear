@@ -93,6 +93,8 @@ parser.add_argument('--overlap-console', type=int, default=1,
                     help='whether to print overlap summary to console: 1 or 0')
 # 动态rank增加：
 parser.add_argument('--compress-rank', type=int, default=8)
+parser.add_argument('--compress-rank-overrides', type=str, default='',
+                    help='comma-separated parameter-specific rank overrides, e.g. name=32,other=16')
 parser.add_argument('--compress-warmup', type=int, default=500)
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
@@ -464,6 +466,7 @@ if hvd.size() > 1:
                                          (device=torch.device('cuda', args.local_rank),
     rank=args.compress_rank,
     rank_schedule=RANK_SCHEDULES[args.rank_schedule],
+    rank_overrides=args.compress_rank_overrides,
     warmup_steps=args.compress_warmup,
     min_compression_numel=args.compress_min_numel,), 
 

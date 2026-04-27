@@ -827,7 +827,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                             p_size = p.numel()
                             q_size = p.numel()
                         else:
-                            rank_compression = self._compression.rank
+                            if hasattr(self._compression, 'max_rank_for'):
+                                rank_compression = self._compression.max_rank_for(name)
+                            else:
+                                rank_compression = self._compression.rank
                             p_size = self._compression.get_factor_numel(
                                 p.shape, name=name, factor_kind='p', rank=rank_compression
                             )

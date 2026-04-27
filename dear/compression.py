@@ -41,7 +41,8 @@ class HalfRankKReducer(Reducer):
     """
 
     def __init__(self, random_seed=0, device=None, timer=None, rank=2,
-                 rank_schedule=None, warmup_steps=200, min_compression_numel=16384):
+                 rank_schedule=None, warmup_steps=200,
+                 min_compression_numel=16384, rank_overrides=None):
         """
         参数说明：
           rank          : 默认/初始rank值，当rank_schedule未覆盖当前step时使用。
@@ -53,6 +54,7 @@ class HalfRankKReducer(Reducer):
                           2. callable  fn(step) -> int
                              完全自定义，可实现任意调度逻辑。
                           如果为 None，则始终使用 rank 参数（固定rank，兼容旧行为）。
+          rank_overrides: 按参数名覆盖rank，格式为"name=rank,name=rank"。
         """
         super().__init__(random_seed, device, timer)
 
@@ -61,6 +63,12 @@ class HalfRankKReducer(Reducer):
 
         # 动态rank调度器，None表示退化为固定rank
         self.rank_schedule = rank_schedule
+
+        self.rank_overrides = {}
+        if rank_overrides:
+            for item in str(rank_overrides).split(','):
+                name, value = item.split('=', 1)
+                self.rank_overrides[name.strip().lower()] = int(value)
 
         # ---- 每个tensor key的内存 ----
         self.p_memory = {}          # {key: Tensor(n, rank)}
@@ -130,20 +138,23 @@ class HalfRankKReducer(Reducer):
     # ------------------------------------------------------------------
     # 工具方法：根据当前step计算本轮实际使用的rank
     # ------------------------------------------------------------------
-    def _get_rank(self, step, n, m):
+    def _get_rank(self, step, n, m, name=None):
         """
         计算当前step应使用的rank值。
 
         规则：
-          1. 如果提供了rank_schedule，按调度器确定基础rank；
-          2. 再用 min(n, m, base_rank) 保证rank不超过矩阵维度上限；
-          3. 保证最小值为1，防止rank退化为0导致空矩阵。
+          1. 如果参数名命中rank_overrides，优先使用覆盖rank；
+          2. 否则如果提供了rank_schedule，按调度器确定基础rank；
+          3. 再用 min(n, m, base_rank) 保证rank不超过矩阵维度上限；
+          4. 保证最小值为1，防止rank退化为0导致空矩阵。
 
         参数：
           step : 当前训练步数（外部传入，从dopt_rsag的step获取）
           n, m : 当前tensor reshape后的矩阵维度
         """
-        if self.rank_schedule is None:
+        if name is not None and name.lower() in self.rank_overrides:
+            base_rank = self.rank_overrides[name.lower()]
+        elif self.rank_schedule is None:
             # 未配置调度器，使用固定rank（兼容旧接口）
             base_rank = self.default_rank
         elif callable(self.rank_schedule):
@@ -206,19 +217,29 @@ class HalfRankKReducer(Reducer):
         callable 调度时无法静态确定，退回 default_rank（调用方负责保证够大）。
         """
         if self.rank_schedule is None:
-            return self.default_rank
+            base_rank = self.default_rank
         
         # TODO 这里逻辑有问题，为什么不按照轮次来选择：
         elif callable(self.rank_schedule):
             # 函数式调度无法静态分析，由外部保证 default_rank >= 实际最大rank
-            return self.default_rank
+            base_rank = self.default_rank
         
         # TODO 这里逻辑有问题，为什么不按照轮次来选择：
         else:
             # dict 调度：取所有阶段 rank 的最大值，保证 buffer 足够大
-            return max(self.rank_schedule.values())
+            base_rank = max(self.rank_schedule.values())
 
-    # compression.py 里加一个方法
+        if self.rank_overrides:
+            return max(base_rank, max(self.rank_overrides.values()))
+        return base_rank
+
+    def max_rank_for(self, name=None):
+        if name is not None and name.lower() in self.rank_overrides:
+            return self.rank_overrides[name.lower()]
+        if self.rank_schedule is None or callable(self.rank_schedule):
+            return self.default_rank
+        return max(self.rank_schedule.values())
+
     def get_rank_for(self, name, shape):
         """
         供外部（dopt_rsag）查询某个tensor当前实际使用的rank。
@@ -226,7 +247,7 @@ class HalfRankKReducer(Reducer):
         保证与 compress 端的 key 定义严格一致。
         """
         key = (name, tuple(shape))
-        return self.rank_memory.get(key, self.default_rank)
+        return self.rank_memory.get(key, self.max_rank_for(name))
 
     def get_factor_numel(self, shape, name=None, factor_kind='p', rank=None):
         if not self.should_compress_shape(shape, name=name):
@@ -285,7 +306,7 @@ class HalfRankKReducer(Reducer):
         n, m = grad_matrix.shape
 
         # ---- 动态rank核心：计算本轮rank并按需重建内存 ----
-        rank = self._get_rank(step, n, m)
+        rank = self._get_rank(step, n, m, name=name)
         # key同时包含shape，防止同name不同shape的tensor复用同一内存
         key = (name, tuple(tensor.shape))
         # 检测rank变化，变化时清除旧内存（含residual）
