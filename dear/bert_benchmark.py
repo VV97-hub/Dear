@@ -558,7 +558,8 @@ def benchmark_step():
     # 测试NaN的来源 SHAN with torch.autograd.detect_anomaly():
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    forward_start = time.perf_counter()
+    if overlap_enabled and hasattr(optimizer, 'profile_forward_start'):
+        optimizer.profile_forward_start()
     outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_masks)
     prediction_scores = outputs.prediction_logits
     seq_relationship_score = outputs.seq_relationship_logits
@@ -566,7 +567,7 @@ def benchmark_step():
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_forward_done'):
-        optimizer.profile_forward_done(time.perf_counter() - forward_start)
+        optimizer.profile_forward_done()
 
     if hvd.rank() == 0 and step % 5 == 0:
         print("step:",step)
@@ -576,12 +577,11 @@ def benchmark_step():
         optimizer.profile_backward_start()
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    backward_start = time.perf_counter()
     loss.backward()
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_backward_done'):
-        optimizer.profile_backward_done(time.perf_counter() - backward_start)
+        optimizer.profile_backward_done()
     
     optimizer.step()
 
@@ -640,19 +640,12 @@ if overlap_enabled and hasattr(optimizer, 'profile_summary'):
     if hvd.rank() == 0 and args.overlap_console and overlap_summary.get('num_steps', 0) > 0:
         log(
             'Overlap summary: steps=%d, '
-            'forward_total=%.6f s, forward_compute=%.6f s, '
-            'ag_window=%.6f s, ag_overlap=%.6f s, backward_total=%.6f s, '
-            'rs_window=%.6f s, rs_overlap=%.6f s, rs_tail=%.6f s, '
+            'forward_total=%.6f s, backward_total=%.6f s, rs_tail=%.6f s, '
             'ag_wait=%.6f s, update=%.6f s'
             % (
                 overlap_summary['num_steps'],
                 overlap_summary['forward_total_s'],
-                overlap_summary['forward_compute_only_est_s'],
-                overlap_summary['ag_comm_window_s'],
-                overlap_summary['ag_overlap_with_forward_compute_s'],
                 overlap_summary['backward_total_s'],
-                overlap_summary['rs_comm_window_s'],
-                overlap_summary['rs_overlap_with_backward_s'],
                 overlap_summary['rs_tail_wait_s'],
                 overlap_summary['ag_wait_s'],
                 overlap_summary['update_s'],

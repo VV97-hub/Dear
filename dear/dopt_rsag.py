@@ -66,6 +66,7 @@ class OverlapProfiler(object):
         self.output_path = output_path
         self.timeline_output_path = timeline_output_path
         self.console_enabled = console_enabled
+        self.group_count = 0
         self.current = None
         self.pending = None
         self.pending_forward = self._new_pending_forward()
@@ -79,18 +80,40 @@ class OverlapProfiler(object):
             with open(self.timeline_output_path + '.meta.json', 'w') as f:
                 json.dump({}, f)
 
+    def _new_group_trace(self, group_idx):
+        return {
+            'group_idx': int(group_idx),
+            'rs_ready_ts': None,
+            'rs_issue_ts': None,
+            'rs_global_release_ts': None,
+            'ag_issue_ts': None,
+            'ag_wait_start_ts': None,
+            'ag_wait_end_ts': None,
+            'update_start_ts': None,
+            'update_end_ts': None,
+            'update_total_s': 0.0,
+            'update_calls': 0,
+            'forward_gate_ts': None,
+            'forward_end_ts': None,
+        }
+
+    def _new_group_traces(self):
+        return {idx: self._new_group_trace(idx) for idx in range(self.group_count)}
+
+    def _ensure_group_trace(self, record, group_idx):
+        if record is None or group_idx is None:
+            return None
+        idx = int(group_idx)
+        traces = record.setdefault('group_traces', {})
+        if idx not in traces:
+            traces[idx] = self._new_group_trace(idx)
+        return traces[idx]
+
     def _new_pending_forward(self):
         return {
             'ag_wait_s': 0.0,
-            'ag_wait_calls': 0,
-            'ag_wait_intervals': [],
-            'ag_group_sync_end_ts': {},
             'update_s': 0.0,
-            'update_calls': 0,
-            'update_intervals': [],
-            'ag_launches': 0,
             'ag_last_sync_end_ts': None,
-            'ag_first_update_start_ts': None,
         }
 
     def _new_record(self, step):
@@ -98,32 +121,22 @@ class OverlapProfiler(object):
             'step': int(step),
             'forward_step': None,
             'forward_total_s': 0.0,
-            'forward_compute_only_est_s': 0.0,
-            'ag_comm_window_s': 0.0,
-            'ag_overlap_with_forward_compute_s': 0.0,
             'backward_total_s': 0.0,
             'rs_launches': 0,
             'rs_first_launch_ts': None,
-            'rs_last_launch_ts': None,
             'rs_sync_end_ts': None,
-            'rs_comm_window_s': 0.0,
-            'rs_overlap_with_backward_s': 0.0,
             'rs_tail_wait_s': 0.0,
             'ag_first_launch_ts': None,
             'ag_last_sync_end_ts': None,
-            'ag_first_update_start_ts': None,
             'ag_wait_s': 0.0,
-            'ag_wait_calls': 0,
             'update_s': 0.0,
-            'update_calls': 0,
             'ag_launches': 0,
             'backward_start_ts': None,
             'backward_end_ts': None,
             'step_start_ts': None,
             'forward_start_ts': None,
             'forward_end_ts': None,
-            'ag_group_launch_ts': {},
-            'rs_group_launch_ts': {},
+            'group_traces': self._new_group_traces(),
             'events': [],
         }
 
@@ -148,6 +161,7 @@ class OverlapProfiler(object):
     def set_topology(self, module_groups, group_stats=None):
         if not self.enabled or not self.timeline_enabled or self.rank_id != 0 or not self.timeline_output_path:
             return
+        self.group_count = len(module_groups)
         groups = []
         for idx, group in enumerate(module_groups):
             item = {'group_idx': idx, 'modules': list(group)}
@@ -161,38 +175,38 @@ class OverlapProfiler(object):
         with open(self.timeline_output_path + '.meta.json', 'w') as f:
             json.dump(payload, f, indent=2)
 
-    def note_forward_total(self, duration_s, step):
+    def note_forward_start(self, step):
+        if not self.enabled or self.pending is None:
+            return
+        self.pending['forward_step'] = int(step)
+        self.pending['forward_start_ts'] = time.perf_counter()
+
+    def note_forward_total(self, duration_s=None, step=None):
         if not self.enabled:
             return
-        forward_end_ts = time.perf_counter()
-        forward_start_ts = forward_end_ts - float(duration_s)
         if self.pending is not None:
+            forward_end_ts = time.perf_counter()
+            forward_start_ts = self.pending.get('forward_start_ts')
+            if forward_start_ts is None and duration_s is not None:
+                forward_start_ts = forward_end_ts - float(duration_s)
+            if forward_start_ts is None:
+                forward_start_ts = forward_end_ts
+            duration_s = max(0.0, forward_end_ts - forward_start_ts)
             pending_ag = self.pending_forward['ag_wait_s']
             pending_update = self.pending_forward['update_s']
-            self.pending['forward_step'] = int(step)
+            if step is not None:
+                self.pending['forward_step'] = int(step)
             self.pending['forward_total_s'] = float(duration_s)
             self.pending['forward_start_ts'] = forward_start_ts
             self.pending['forward_end_ts'] = forward_end_ts
             self.pending['ag_wait_s'] = pending_ag
-            self.pending['ag_wait_calls'] = self.pending_forward['ag_wait_calls']
             self.pending['update_s'] = pending_update
-            self.pending['update_calls'] = self.pending_forward['update_calls']
             self.pending['ag_last_sync_end_ts'] = self.pending_forward['ag_last_sync_end_ts']
-            self.pending['ag_first_update_start_ts'] = self.pending_forward['ag_first_update_start_ts']
             self._append_event(
                 self.pending,
                 event_type='forward_total',
                 start_ts=forward_start_ts,
                 end_ts=forward_end_ts,
-            )
-            self.pending['forward_compute_only_est_s'] = max(
-                0.0, float(duration_s) - pending_ag - pending_update
-            )
-            self.pending['ag_comm_window_s'] = self._compute_ag_comm_window_s(
-                forward_start_ts, forward_end_ts
-            )
-            self.pending['ag_overlap_with_forward_compute_s'] = self._compute_ag_overlap_with_forward_compute_s(
-                forward_start_ts, forward_end_ts
             )
             self._finalize_pending()
             self.pending_forward = self._new_pending_forward()
@@ -202,28 +216,49 @@ class OverlapProfiler(object):
             return
         self.current['backward_start_ts'] = time.perf_counter()
 
-    def note_backward_total(self, duration_s):
+    def note_backward_total(self, duration_s=None):
         if not self.enabled or self.current is None:
             return
-        self.current['backward_total_s'] = float(duration_s)
-        self.current['backward_end_ts'] = time.perf_counter()
+        backward_end_ts = time.perf_counter()
+        backward_start_ts = self.current.get('backward_start_ts')
+        if backward_start_ts is None and duration_s is not None:
+            backward_start_ts = backward_end_ts - float(duration_s)
+        if backward_start_ts is None:
+            backward_start_ts = backward_end_ts
+        self.current['backward_total_s'] = max(0.0, backward_end_ts - backward_start_ts)
+        self.current['backward_end_ts'] = backward_end_ts
         self._append_event(
             self.current,
             event_type='backward_total',
-            start_ts=self.current['backward_end_ts'] - float(duration_s),
-            end_ts=self.current['backward_end_ts'],
+            start_ts=backward_start_ts,
+            end_ts=backward_end_ts,
         )
 
-    def note_rs_launch(self, group_idx=None):
+    def note_rs_ready(self, group_idx=None):
+        if not self.enabled or self.current is None:
+            return
+        now = time.perf_counter()
+        group_trace = self._ensure_group_trace(self.current, group_idx)
+        if group_trace is not None and group_trace['rs_ready_ts'] is None:
+            group_trace['rs_ready_ts'] = now
+        self._append_event(
+            self.current,
+            event_type='rs_ready',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+        )
+
+    def note_rs_issue(self, group_idx=None):
         if not self.enabled or self.current is None:
             return
         now = time.perf_counter()
         self.current['rs_launches'] += 1
         if self.current['rs_first_launch_ts'] is None:
             self.current['rs_first_launch_ts'] = now
-        self.current['rs_last_launch_ts'] = now
-        if group_idx is not None and int(group_idx) not in self.current['rs_group_launch_ts']:
-            self.current['rs_group_launch_ts'][int(group_idx)] = now
+        group_trace = self._ensure_group_trace(self.current, group_idx)
+        if group_trace is not None and group_trace['rs_issue_ts'] is None:
+            group_trace['rs_issue_ts'] = now
         self._append_event(
             self.current,
             event_type='rs_launch',
@@ -232,28 +267,20 @@ class OverlapProfiler(object):
             group_idx=group_idx,
         )
 
-    def note_rs_sync(self, wait_s):
+    def note_rs_sync(self, wait_s=None, start_ts=None, end_ts=None):
         if not self.enabled or self.current is None:
             return
-        end_ts = time.perf_counter()
-        start_ts = end_ts - float(wait_s)
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            if wait_s is None:
+                start_ts = end_ts
+            else:
+                start_ts = end_ts - float(wait_s)
         self.current['rs_sync_end_ts'] = end_ts
-        if self.current['rs_first_launch_ts'] is not None:
-            self.current['rs_comm_window_s'] = max(
-                0.0, end_ts - self.current['rs_first_launch_ts']
-            )
         if self.current['backward_end_ts'] is not None:
             self.current['rs_tail_wait_s'] = max(
                 0.0, end_ts - self.current['backward_end_ts']
-            )
-        if (
-            self.current['backward_end_ts'] is not None
-            and self.current['rs_first_launch_ts'] is not None
-        ):
-            overlap_end = min(self.current['backward_end_ts'], end_ts)
-            overlap_start = min(overlap_end, self.current['rs_first_launch_ts'])
-            self.current['rs_overlap_with_backward_s'] = max(
-                0.0, overlap_end - overlap_start
             )
         self._append_event(
             self.current,
@@ -261,26 +288,26 @@ class OverlapProfiler(object):
             start_ts=start_ts,
             end_ts=end_ts,
         )
-        for group_idx, launch_ts in sorted(self.current['rs_group_launch_ts'].items()):
-            self._append_event(
-                self.current,
-                event_type='rs_comm',
-                start_ts=launch_ts,
-                end_ts=end_ts,
-                group_idx=group_idx,
-            )
+        for group_idx, group_trace in sorted(self.current.get('group_traces', {}).items()):
+            group_trace['rs_global_release_ts'] = end_ts
 
-    def note_ag_wait(self, duration_s, group_idx=None, module_name=None):
+    def note_ag_wait(self, duration_s=None, group_idx=None, module_name=None, start_ts=None, end_ts=None):
         if not self.enabled or self.pending is None:
             return
-        end_ts = time.perf_counter()
-        start_ts = end_ts - float(duration_s)
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            if duration_s is None:
+                start_ts = end_ts
+            else:
+                start_ts = end_ts - float(duration_s)
+        duration_s = max(0.0, end_ts - start_ts)
         self.pending_forward['ag_wait_s'] += float(duration_s)
-        self.pending_forward['ag_wait_calls'] += 1
-        self.pending_forward['ag_wait_intervals'].append((start_ts, end_ts))
         self.pending_forward['ag_last_sync_end_ts'] = end_ts
-        if group_idx is not None:
-            self.pending_forward['ag_group_sync_end_ts'][int(group_idx)] = end_ts
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None:
+            group_trace['ag_wait_start_ts'] = start_ts
+            group_trace['ag_wait_end_ts'] = end_ts
         self._append_event(
             self.pending,
             event_type='ag_wait',
@@ -290,17 +317,25 @@ class OverlapProfiler(object):
             module_name=module_name,
         )
 
-    def note_update(self, duration_s, end_ts=None, module_name=None, group_idx=None):
+    def note_update(self, duration_s=None, end_ts=None, module_name=None, group_idx=None, start_ts=None):
         if not self.enabled or self.pending is None:
             return
         if end_ts is None:
             end_ts = time.perf_counter()
-        start_ts = end_ts - float(duration_s)
-        if self.pending_forward['ag_first_update_start_ts'] is None:
-            self.pending_forward['ag_first_update_start_ts'] = start_ts
+        if start_ts is None:
+            if duration_s is None:
+                start_ts = end_ts
+            else:
+                start_ts = end_ts - float(duration_s)
+        duration_s = max(0.0, end_ts - start_ts)
         self.pending_forward['update_s'] += float(duration_s)
-        self.pending_forward['update_calls'] += 1
-        self.pending_forward['update_intervals'].append((start_ts, end_ts))
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None:
+            if group_trace['update_start_ts'] is None:
+                group_trace['update_start_ts'] = start_ts
+            group_trace['update_end_ts'] = end_ts
+            group_trace['update_total_s'] += float(duration_s)
+            group_trace['update_calls'] += 1
         self._append_event(
             self.pending,
             event_type='update',
@@ -310,7 +345,39 @@ class OverlapProfiler(object):
             module_name=module_name,
         )
 
-    def note_ag_launch(self, group_idx=None):
+    def note_forward_gate(self, group_idx=None, module_name=None):
+        if not self.enabled or self.pending is None:
+            return
+        now = time.perf_counter()
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None and group_trace['forward_gate_ts'] is None:
+            group_trace['forward_gate_ts'] = now
+        self._append_event(
+            self.pending,
+            event_type='forward_gate',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+            module_name=module_name,
+        )
+
+    def note_forward_end(self, group_idx=None, module_name=None):
+        if not self.enabled or self.pending is None:
+            return
+        now = time.perf_counter()
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None and group_trace['forward_end_ts'] is None:
+            group_trace['forward_end_ts'] = now
+        self._append_event(
+            self.pending,
+            event_type='forward_end',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+            module_name=module_name,
+        )
+
+    def note_ag_issue(self, group_idx=None):
         if not self.enabled:
             return
         target = self.pending if self.pending is not None else self.current
@@ -320,8 +387,9 @@ class OverlapProfiler(object):
         target['ag_launches'] += 1
         if target['ag_first_launch_ts'] is None:
             target['ag_first_launch_ts'] = now
-        if group_idx is not None and int(group_idx) not in target['ag_group_launch_ts']:
-            target['ag_group_launch_ts'][int(group_idx)] = now
+        group_trace = self._ensure_group_trace(target, group_idx)
+        if group_trace is not None and group_trace['ag_issue_ts'] is None:
+            group_trace['ag_issue_ts'] = now
         self._append_event(
             target,
             event_type='ag_launch',
@@ -330,54 +398,51 @@ class OverlapProfiler(object):
             group_idx=group_idx,
         )
 
-    def _interval_overlap(self, a_start, a_end, b_start, b_end):
-        return max(0.0, min(a_end, b_end) - max(a_start, b_start))
-
-    def _compute_ag_comm_window_s(self, forward_start_ts, forward_end_ts):
-        if self.pending is None:
-            return 0.0
-        ag_first_launch_ts = self.pending.get('ag_first_launch_ts')
-        ag_last_sync_end_ts = self.pending_forward.get('ag_last_sync_end_ts')
-        if ag_first_launch_ts is None or ag_last_sync_end_ts is None:
-            return 0.0
-        return max(0.0, ag_last_sync_end_ts - ag_first_launch_ts)
-
-    def _compute_ag_overlap_with_forward_compute_s(self, forward_start_ts, forward_end_ts):
-        if self.pending is None:
-            return 0.0
-        ag_first_launch_ts = self.pending.get('ag_first_launch_ts')
-        ag_last_sync_end_ts = self.pending_forward.get('ag_last_sync_end_ts')
-        if ag_first_launch_ts is None or ag_last_sync_end_ts is None:
-            return 0.0
-
-        overlap = self._interval_overlap(
-            ag_first_launch_ts, ag_last_sync_end_ts, forward_start_ts, forward_end_ts
-        )
-        for start_ts, end_ts in self.pending_forward['ag_wait_intervals']:
-            overlap -= self._interval_overlap(
-                ag_first_launch_ts, ag_last_sync_end_ts, start_ts, end_ts
-            )
-        for start_ts, end_ts in self.pending_forward['update_intervals']:
-            overlap -= self._interval_overlap(
-                ag_first_launch_ts, ag_last_sync_end_ts, start_ts, end_ts
-            )
-        return max(0.0, overlap)
-
-    def _emit_ag_group_events(self, record):
-        if record is None:
-            return
-        sync_end_map = self.pending_forward.get('ag_group_sync_end_ts', {})
-        for group_idx, launch_ts in sorted(record.get('ag_group_launch_ts', {}).items()):
-            end_ts = sync_end_map.get(int(group_idx))
-            if end_ts is None:
-                continue
-            self._append_event(
-                record,
-                event_type='ag_comm',
-                start_ts=launch_ts,
-                end_ts=end_ts,
-                group_idx=group_idx,
-            )
+    def _group_traces_payload(self, record, cycle_start_ts):
+        payload = []
+        for group_idx, group_trace in sorted(record.get('group_traces', {}).items()):
+            item = dict(group_trace)
+            for field in [
+                'rs_ready_ts',
+                'rs_issue_ts',
+                'rs_global_release_ts',
+                'ag_issue_ts',
+                'ag_wait_start_ts',
+                'ag_wait_end_ts',
+                'update_start_ts',
+                'update_end_ts',
+                'forward_gate_ts',
+                'forward_end_ts',
+            ]:
+                ts = item.get(field)
+                if ts is not None and cycle_start_ts is not None:
+                    item[field.replace('_ts', '_ms')] = (ts - cycle_start_ts) * 1000.0
+            if item.get('rs_issue_ts') is not None and item.get('rs_global_release_ts') is not None:
+                item['rs_issue_to_global_release_s'] = max(
+                    0.0, item['rs_global_release_ts'] - item['rs_issue_ts']
+                )
+            if item.get('ag_issue_ts') is not None and item.get('ag_wait_end_ts') is not None:
+                item['ag_issue_to_wait_end_s'] = max(
+                    0.0, item['ag_wait_end_ts'] - item['ag_issue_ts']
+                )
+            if item.get('ag_wait_start_ts') is not None and item.get('ag_wait_end_ts') is not None:
+                item['ag_wait_s'] = max(
+                    0.0, item['ag_wait_end_ts'] - item['ag_wait_start_ts']
+                )
+            if item.get('update_start_ts') is not None and item.get('update_end_ts') is not None:
+                item['update_span_s'] = max(
+                    0.0, item['update_end_ts'] - item['update_start_ts']
+                )
+            if item.get('ag_wait_end_ts') is not None and item.get('forward_gate_ts') is not None:
+                item['resume_to_forward_gate_s'] = max(
+                    0.0, item['forward_gate_ts'] - item['ag_wait_end_ts']
+                )
+            if item.get('forward_gate_ts') is not None and item.get('forward_end_ts') is not None:
+                item['forward_gate_to_end_s'] = max(
+                    0.0, item['forward_end_ts'] - item['forward_gate_ts']
+                )
+            payload.append(item)
+        return payload
 
     def mark_step_pending(self):
         if not self.enabled or self.current is None:
@@ -389,15 +454,11 @@ class OverlapProfiler(object):
     def _emit_record(self, record):
         if self.rank_id != 0:
             return
-        self._emit_ag_group_events(record)
         if self.summary_enabled and self.output_path:
             ordered_keys = [
-                'step', 'forward_step', 'forward_total_s', 'forward_compute_only_est_s',
-                'ag_comm_window_s', 'ag_overlap_with_forward_compute_s',
-                'backward_total_s', 'rs_launches', 'rs_comm_window_s',
-                'rs_overlap_with_backward_s', 'rs_tail_wait_s',
-                'ag_launches', 'ag_wait_s', 'ag_wait_calls',
-                'update_s', 'update_calls'
+                'step', 'forward_step', 'forward_total_s',
+                'backward_total_s', 'rs_tail_wait_s',
+                'ag_wait_s', 'update_s', 'rs_launches', 'ag_launches'
             ]
             payload = ','.join(
                 ['%s=%s' % (k, record[k]) for k in ordered_keys]
@@ -413,9 +474,6 @@ class OverlapProfiler(object):
             rs_phase_end_ts = record.get('rs_sync_end_ts')
             ag_phase_start_ts = record.get('ag_first_launch_ts')
             ag_phase_end_ts = record.get('ag_last_sync_end_ts')
-            ag_update_ready_ts = record.get('ag_first_update_start_ts')
-            if ag_update_ready_ts is None:
-                ag_update_ready_ts = ag_phase_end_ts
 
             cycle_start_ts = backward_phase_start_ts
             cycle_end_ts = forward_phase_end_ts
@@ -454,37 +512,28 @@ class OverlapProfiler(object):
                     'start_ts': forward_phase_start_ts,
                     'end_ts': forward_phase_end_ts,
                     'total_s': record['forward_total_s'],
-                    'compute_only_est_s': record['forward_compute_only_est_s'],
                 },
                 'rs_phase': {
                     'start_ts': rs_phase_start_ts,
                     'end_ts': rs_phase_end_ts,
-                    'comm_window_s': record['rs_comm_window_s'],
-                    'overlap_with_backward_s': record['rs_overlap_with_backward_s'],
                     'tail_wait_s': record['rs_tail_wait_s'],
+                    'launches': record['rs_launches'],
                 },
                 'ag_phase': {
                     'start_ts': ag_phase_start_ts,
                     'end_ts': ag_phase_end_ts,
-                    'update_ready_ts': ag_update_ready_ts,
-                    'comm_window_s': record['ag_comm_window_s'],
-                    'overlap_with_forward_compute_s': record['ag_overlap_with_forward_compute_s'],
                     'wait_s': record['ag_wait_s'],
                     'update_s': record['update_s'],
                     'launches': record['ag_launches'],
                 },
                 'summary': {
                     'forward_total_s': record['forward_total_s'],
-                    'forward_compute_only_est_s': record['forward_compute_only_est_s'],
-                    'ag_comm_window_s': record['ag_comm_window_s'],
-                    'ag_overlap_with_forward_compute_s': record['ag_overlap_with_forward_compute_s'],
                     'backward_total_s': record['backward_total_s'],
-                    'rs_comm_window_s': record['rs_comm_window_s'],
-                    'rs_overlap_with_backward_s': record['rs_overlap_with_backward_s'],
                     'rs_tail_wait_s': record['rs_tail_wait_s'],
                     'ag_wait_s': record['ag_wait_s'],
                     'update_s': record['update_s'],
                 },
+                'group_traces': self._group_traces_payload(record, cycle_start_ts),
                 'events': events,
             }
             with open(self.timeline_output_path, 'a') as f:
@@ -502,18 +551,12 @@ class OverlapProfiler(object):
         means = self.summary()
         print(
             '[OverlapSummary] steps=%d '
-            'forward_total=%.6f forward_compute=%.6f ag_window=%.6f ag_overlap=%.6f backward_total=%.6f '
-            'rs_window=%.6f rs_overlap=%.6f rs_tail=%.6f '
-            'ag_wait=%.6f update=%.6f'
+            'forward_total=%.6f backward_total=%.6f '
+            'rs_tail=%.6f ag_wait=%.6f update=%.6f'
             % (
                 means['num_steps'],
                 means['forward_total_s'],
-                means['forward_compute_only_est_s'],
-                means['ag_comm_window_s'],
-                means['ag_overlap_with_forward_compute_s'],
                 means['backward_total_s'],
-                means['rs_comm_window_s'],
-                means['rs_overlap_with_backward_s'],
                 means['rs_tail_wait_s'],
                 means['ag_wait_s'],
                 means['update_s'],
@@ -536,12 +579,7 @@ class OverlapProfiler(object):
             return {'num_steps': 0}
         keys = [
             'forward_total_s',
-            'forward_compute_only_est_s',
-            'ag_comm_window_s',
-            'ag_overlap_with_forward_compute_s',
             'backward_total_s',
-            'rs_comm_window_s',
-            'rs_overlap_with_backward_s',
             'rs_tail_wait_s',
             'ag_wait_s',
             'update_s',
@@ -556,19 +594,12 @@ class OverlapProfiler(object):
             return
         with open(self.output_path, 'a') as f:
             f.write(
-                'SUMMARY,steps=%d,forward_total_s=%s,forward_compute_only_est_s=%s,'
-                'ag_comm_window_s=%s,ag_overlap_with_forward_compute_s=%s,'
-                'backward_total_s=%s,rs_comm_window_s=%s,rs_overlap_with_backward_s=%s,'
+                'SUMMARY,steps=%d,forward_total_s=%s,backward_total_s=%s,'
                 'rs_tail_wait_s=%s,ag_wait_s=%s,update_s=%s\n'
                 % (
                     summary['num_steps'],
                     summary['forward_total_s'],
-                    summary['forward_compute_only_est_s'],
-                    summary['ag_comm_window_s'],
-                    summary['ag_overlap_with_forward_compute_s'],
                     summary['backward_total_s'],
-                    summary['rs_comm_window_s'],
-                    summary['rs_overlap_with_backward_s'],
                     summary['rs_tail_wait_s'],
                     summary['ag_wait_s'],
                     summary['update_s'],
@@ -731,6 +762,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         assert len(module_groups) == len(param_groups)
         self._num_groups = len(module_groups)
+        self._group_module_counts = [len(group) for group in module_groups]
         self._module_group_flags = [0]*len(module_groups) # check whether module group is gathered
         self._param_group_flags = [[0]*len(g) for g in param_groups] # check whether param group is ready
         topology_module_groups = [
@@ -886,13 +918,16 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     def profile_step_begin(self):
         self._overlap_profiler.begin_step(self._num_steps)
 
-    def profile_forward_done(self, duration_s):
+    def profile_forward_start(self):
+        self._overlap_profiler.note_forward_start(self._num_steps)
+
+    def profile_forward_done(self, duration_s=None):
         self._overlap_profiler.note_forward_total(duration_s, self._num_steps)
 
     def profile_backward_start(self):
         self._overlap_profiler.note_backward_start()
 
-    def profile_backward_done(self, duration_s):
+    def profile_backward_done(self, duration_s=None):
         self._overlap_profiler.note_backward_total(duration_s)
 
     def profile_summary(self):
@@ -945,6 +980,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             if self.exclude_allgather: # for time breakdown record
                 break
             module.register_forward_pre_hook(self._forward_pre_hook) # 为模型注册 前向传播钩子
+            module.register_forward_hook(self._forward_hook)
         
         # register backward hooks
         for i, p in enumerate(self._register_parameters):
@@ -1009,19 +1045,27 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                             return
                     # 全部 ready，触发通信（用压缩 buffer）
                     comm_name = 'reduceScatter-group-%d' % group_idx
-                    self._overlap_profiler.note_rs_launch(group_idx=group_idx)
+                    self._overlap_profiler.note_rs_ready(group_idx=group_idx)
                     reduce_scatter_comm.collective_async_(
                         comm_name,
                         compressed_pad_buffers[group_idx],
-                        compressed_shard_buffers[group_idx]
+                        compressed_shard_buffers[group_idx],
+                        profiler=self._overlap_profiler,
+                        group_idx=group_idx,
                     )
             else:
                 # 原有逻辑，push_to_buffer函数满了，才会返回pad_grad != None
                 new_name, pad_grad, shard_grad = self._push_to_buffer(name, tensor)
                 if pad_grad is not None:
                     rs_group_idx = self._param_group_idx[name][0]
-                    self._overlap_profiler.note_rs_launch(group_idx=rs_group_idx)
-                    reduce_scatter_comm.collective_async_(new_name, pad_grad, shard_grad)
+                    self._overlap_profiler.note_rs_ready(group_idx=rs_group_idx)
+                    reduce_scatter_comm.collective_async_(
+                        new_name,
+                        pad_grad,
+                        shard_grad,
+                        profiler=self._overlap_profiler,
+                        group_idx=rs_group_idx,
+                    )
             return grad # 注意：hook 应该返回处理后的 grad
         return hook
     
@@ -1084,7 +1128,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 ag_wait_start = time.perf_counter()
                 all_gather_comm.synchronize()
                 self._overlap_profiler.note_ag_wait(
-                    time.perf_counter() - ag_wait_start,
+                    start_ts=ag_wait_start,
+                    end_ts=time.perf_counter(),
                     group_idx=group_idx,
                     module_name=name,
                 )
@@ -1099,6 +1144,21 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
             # update params for this module
             self._update_one_module(module, name, group_idx)
+            if sub_idx == 0:
+                self._overlap_profiler.note_forward_gate(
+                    group_idx=group_idx,
+                    module_name=name,
+                )
+
+    def _forward_hook(self, module, input, output):
+        if torch.is_grad_enabled() and self._num_steps > 0:
+            name = self._module_names.get(module)
+            group_idx, sub_idx = self._module_group_idx[name]
+            if sub_idx == self._group_module_counts[group_idx] - 1:
+                self._overlap_profiler.note_forward_end(
+                    group_idx=group_idx,
+                    module_name=name,
+                )
     
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
@@ -1157,7 +1217,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             torch.cuda.synchronize()
         update_end = time.perf_counter()
         self._overlap_profiler.note_update(
-            update_end - update_start,
+            start_ts=update_start,
             end_ts=update_end,
             module_name=module_name,
             group_idx=group_idx,
@@ -1290,7 +1350,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         pass
     
     def _allgather_one_group(self, group_idx):
-        self._overlap_profiler.note_ag_launch(group_idx=group_idx)
         if self._active_compression_factor is not None:
             compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(
                 self._active_compression_factor
@@ -1298,12 +1357,20 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             all_gather_comm.collective_async_(
                 "allGather-group-%d" % group_idx,
                 compressed_pad_buffers[group_idx],
-                compressed_shard_buffers[group_idx]
+                compressed_shard_buffers[group_idx],
+                profiler=self._overlap_profiler,
+                group_idx=group_idx,
             )
         else:
             pad_grad = self._pad_buffers[group_idx]
             shard_grad = self._shard_buffers[group_idx]
-            all_gather_comm.collective_async_("allGather-group-%d" % group_idx, pad_grad, shard_grad)
+            all_gather_comm.collective_async_(
+                "allGather-group-%d" % group_idx,
+                pad_grad,
+                shard_grad,
+                profiler=self._overlap_profiler,
+                group_idx=group_idx,
+            )
 
     """"    上面改为了压缩版
     def _allgather_one_group(self, group_idx):
@@ -1323,7 +1390,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # 所有RS的同步操作
         rs_sync_start = time.perf_counter()
         reduce_scatter_comm.synchronize()
-        self._overlap_profiler.note_rs_sync(time.perf_counter() - rs_sync_start)
+        self._overlap_profiler.note_rs_sync(
+            start_ts=rs_sync_start,
+            end_ts=time.perf_counter(),
+        )
         # print("Rank %d: Step %d, ReduceScatter time: %.10f sec" % (rank(), self._num_steps, rs_time))
 
         if self._compression and self._num_steps > self._compression.warmup_steps:

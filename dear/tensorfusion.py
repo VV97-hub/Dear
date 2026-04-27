@@ -472,7 +472,7 @@ class CommReduceScatter:
     def init_tensor_group(self, tensor_names, num_nearby_layers=NUM_NEARBY_LAYERS):
         pass
 
-    def collective_async_(self, name, pad_tensor, shard_tensor):
+    def collective_async_(self, name, pad_tensor, shard_tensor, profiler=None, group_idx=None):
         self._name_tensors[name] = (pad_tensor, shard_tensor)
         # Validation barrier: ensure the compute stream has finished writing the
         # fusion buffers before NCCL starts reading them on the comm stream.
@@ -480,8 +480,12 @@ class CommReduceScatter:
         current_stream.synchronize()
 
         if self.op == CollectiveOp.REDUCE_SCATTER:
+            if profiler is not None:
+                profiler.note_rs_issue(group_idx=group_idx)
             handle = self.merged_comm.reduceScatter(pad_tensor, shard_tensor)
         elif self.op == CollectiveOp.ALL_GATHER:
+            if profiler is not None:
+                profiler.note_ag_issue(group_idx=group_idx)
             handle = self.merged_comm.allGather(shard_tensor, pad_tensor)
         else:
             raise TypeError
