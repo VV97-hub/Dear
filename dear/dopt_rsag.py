@@ -85,6 +85,9 @@ class OverlapProfiler(object):
             'group_idx': int(group_idx),
             'rs_ready_ts': None,
             'rs_issue_ts': None,
+            'rs_complete_wait_start_ts': None,
+            'rs_complete_ts': None,
+            'rs_complete_cuda_ts': None,
             'rs_global_release_ts': None,
             'ag_issue_ts': None,
             'ag_wait_start_ts': None,
@@ -291,6 +294,31 @@ class OverlapProfiler(object):
         for group_idx, group_trace in sorted(self.current.get('group_traces', {}).items()):
             group_trace['rs_global_release_ts'] = end_ts
 
+    def note_rs_complete(self, group_idx=None, start_ts=None, end_ts=None, cuda_elapsed_ms=None):
+        if not self.enabled or self.current is None:
+            return
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            start_ts = end_ts
+        cuda_complete_ts = None
+        if cuda_elapsed_ms is not None and cuda_elapsed_ms >= 0.0:
+            rs_base_ts = self.current.get('rs_first_launch_ts')
+            if rs_base_ts is not None:
+                cuda_complete_ts = rs_base_ts + float(cuda_elapsed_ms) / 1000.0
+        group_trace = self._ensure_group_trace(self.current, group_idx)
+        if group_trace is not None and group_trace['rs_complete_ts'] is None:
+            group_trace['rs_complete_wait_start_ts'] = start_ts
+            group_trace['rs_complete_ts'] = end_ts
+            group_trace['rs_complete_cuda_ts'] = cuda_complete_ts
+        self._append_event(
+            self.current,
+            event_type='rs_complete_wait',
+            start_ts=start_ts,
+            end_ts=end_ts,
+            group_idx=group_idx,
+        )
+
     def note_ag_wait(self, duration_s=None, group_idx=None, module_name=None, start_ts=None, end_ts=None):
         if not self.enabled or self.pending is None:
             return
@@ -405,6 +433,9 @@ class OverlapProfiler(object):
             for field in [
                 'rs_ready_ts',
                 'rs_issue_ts',
+                'rs_complete_wait_start_ts',
+                'rs_complete_ts',
+                'rs_complete_cuda_ts',
                 'rs_global_release_ts',
                 'ag_issue_ts',
                 'ag_wait_start_ts',
@@ -420,6 +451,18 @@ class OverlapProfiler(object):
             if item.get('rs_issue_ts') is not None and item.get('rs_global_release_ts') is not None:
                 item['rs_issue_to_global_release_s'] = max(
                     0.0, item['rs_global_release_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_issue_ts') is not None and item.get('rs_complete_ts') is not None:
+                item['rs_issue_to_complete_s'] = max(
+                    0.0, item['rs_complete_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_issue_ts') is not None and item.get('rs_complete_cuda_ts') is not None:
+                item['rs_issue_to_complete_cuda_s'] = max(
+                    0.0, item['rs_complete_cuda_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_complete_wait_start_ts') is not None and item.get('rs_complete_ts') is not None:
+                item['rs_completion_wait_s'] = max(
+                    0.0, item['rs_complete_ts'] - item['rs_complete_wait_start_ts']
                 )
             if item.get('ag_issue_ts') is not None and item.get('ag_wait_end_ts') is not None:
                 item['ag_issue_to_wait_end_s'] = max(
@@ -765,6 +808,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._group_module_counts = [len(group) for group in module_groups]
         self._module_group_flags = [0]*len(module_groups) # check whether module group is gathered
         self._param_group_flags = [[0]*len(g) for g in param_groups] # check whether param group is ready
+        self._rs_group_handles = [None] * self._num_groups
         topology_module_groups = [
             [self._module_names[module] for module in module_group]
             for module_group in module_groups
@@ -1049,26 +1093,28 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     # 全部 ready，触发通信（用压缩 buffer）
                     comm_name = 'reduceScatter-group-%d' % group_idx
                     self._overlap_profiler.note_rs_ready(group_idx=group_idx)
-                    reduce_scatter_comm.collective_async_(
+                    handle = reduce_scatter_comm.collective_async_(
                         comm_name,
                         compressed_pad_buffers[group_idx],
                         compressed_shard_buffers[group_idx],
                         profiler=self._overlap_profiler,
                         group_idx=group_idx,
                     )
+                    self._rs_group_handles[group_idx] = handle
             else:
                 # 原有逻辑，push_to_buffer函数满了，才会返回pad_grad != None
                 new_name, pad_grad, shard_grad = self._push_to_buffer(name, tensor)
                 if pad_grad is not None:
                     rs_group_idx = self._param_group_idx[name][0]
                     self._overlap_profiler.note_rs_ready(group_idx=rs_group_idx)
-                    reduce_scatter_comm.collective_async_(
+                    handle = reduce_scatter_comm.collective_async_(
                         new_name,
                         pad_grad,
                         shard_grad,
                         profiler=self._overlap_profiler,
                         group_idx=rs_group_idx,
                     )
+                    self._rs_group_handles[rs_group_idx] = handle
             return grad # 注意：hook 应该返回处理后的 grad
         return hook
     
@@ -1124,8 +1170,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             name = self._module_names.get(module)
             group_idx, sub_idx = self._module_group_idx[name]
 
-            # sync allGather for this group and send for next group
-            if sub_idx == 0 and self._module_group_flags[group_idx] == 0:
+            # Sync this group's allGather on the first actual module that enters
+            # forward, because module registration order may differ from runtime
+            # forward order for shared/embedding modules.
+            if self._module_group_flags[group_idx] == 0:
                 
                 # 等待上一组AG同步完成（Group0的AG是由step函数发起的）
                 ag_wait_start = time.perf_counter()
@@ -1392,11 +1440,26 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # 计时（所有 reduce-scatter 通信 + 被 overlap 剩下的尾巴）  = RS_total_time − backward_overlap_time
         # 所有RS的同步操作
         rs_sync_start = time.perf_counter()
-        reduce_scatter_comm.synchronize()
+        if self._overlap_profiler.enabled:
+            for group_idx, handle in enumerate(self._rs_group_handles):
+                if handle is None:
+                    continue
+                rs_group_wait_start = time.perf_counter()
+                cuda_elapsed_ms = reduce_scatter_comm.synchronize_handle(handle)
+                self._overlap_profiler.note_rs_complete(
+                    group_idx=group_idx,
+                    start_ts=rs_group_wait_start,
+                    end_ts=time.perf_counter(),
+                    cuda_elapsed_ms=cuda_elapsed_ms,
+                )
+            reduce_scatter_comm.clear_synchronized()
+        else:
+            reduce_scatter_comm.synchronize()
         self._overlap_profiler.note_rs_sync(
             start_ts=rs_sync_start,
             end_ts=time.perf_counter(),
         )
+        self._rs_group_handles = [None] * self._num_groups
         # print("Rank %d: Step %d, ReduceScatter time: %.10f sec" % (rank(), self._num_steps, rs_time))
 
         if self._compression and self._num_steps > self._compression.warmup_steps:

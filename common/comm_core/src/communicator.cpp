@@ -88,30 +88,41 @@ void Communicator::_init() {
     m_events = new cudaEvent_t[nstreams];
     m_nccl_comms = new ncclComm_t[nstreams];
     m_sync_flags = new bool[nstreams];
+    CUDACHECK(cudaEventCreate(&m_op_base_event));
+    m_op_base_event_recorded = false;
     for (int i = 0; i < m_num_comms; i++) {
 	    if (m_rank == 0) ncclGetUniqueId(&m_nccl_ids[i]);
 	    MPICHECK(MPI_Bcast((void *)&m_nccl_ids[i], sizeof(m_nccl_ids[i]), MPI_BYTE, 0, MPI_COMM_WORLD));
     }
     for (int i = 0; i < m_num_comms; i++) {
-	    //CUDACHECK(cudaStreamCreate(&m_streams[i]));
+        //CUDACHECK(cudaStreamCreate(&m_streams[i]));
         at::cuda::CUDAStream myStream = at::cuda::getStreamFromPool();
         m_streams[i] = myStream.stream();
         m_torchstreams.push_back(myStream);
-	    CUDACHECK(cudaEventCreate(&m_events[i]));
+        CUDACHECK(cudaEventCreate(&m_events[i]));
+        m_sync_flags[i] = true;
         
         int dev;
         cudaGetDevice(&dev);
         // Dubug：可以看rank和GPU的关系
         // printf("[Rank %d] sees GPU %d\n", m_rank, dev);
         // printf("[Rank %d] , world=%d\n", m_rank, m_size);
-	    NCCLCHECK(ncclCommInitRank(&m_nccl_comms[i], m_size, m_nccl_ids[i], m_rank));
+        NCCLCHECK(ncclCommInitRank(&m_nccl_comms[i], m_size, m_nccl_ids[i], m_rank));
     }
     m_destroyed = false;
 }
 
 void Communicator::destroy() {
+    for (auto &event : m_op_events) {
+        if (event != nullptr) {
+            CUDACHECK(cudaEventDestroy(event));
+            event = nullptr;
+        }
+    }
+    m_op_events.clear();
+    CUDACHECK(cudaEventDestroy(m_op_base_event));
     for (int i = 0; i < m_num_comms; i++) {
-	    NCCLCHECK(ncclCommDestroy(m_nccl_comms[i]));
+        NCCLCHECK(ncclCommDestroy(m_nccl_comms[i]));
         //CUDACHECK(cudaStreamDestroy(m_streams[i]));
         CUDACHECK(cudaEventDestroy(m_events[i]));
     }
@@ -151,11 +162,46 @@ void Communicator::synchronize() {
         //CUDACHECK(cudaStreamWaitEvent(m_streams[i], m_events[i], 0));
         m_sync_flags[i] = true;
     }
+    clearEvents();
 }
 void Communicator::syncStream(int handler) {
     if (handler < m_num_comms && !m_sync_flags[handler]) {
         CUDACHECK(cudaStreamSynchronize(m_streams[handler]));
         m_sync_flags[handler] = true;
+    }
+}
+void Communicator::syncEvent(int handler) {
+    if (handler >= 0 && handler < static_cast<int>(m_op_events.size()) && m_op_events[handler] != nullptr) {
+        CUDACHECK(cudaEventSynchronize(m_op_events[handler]));
+        CUDACHECK(cudaEventDestroy(m_op_events[handler]));
+        m_op_events[handler] = nullptr;
+    }
+}
+
+float Communicator::syncEventElapsedFromBase(int handler) {
+    float elapsed_ms = -1.0f;
+    if (handler >= 0 && handler < static_cast<int>(m_op_events.size()) && m_op_events[handler] != nullptr) {
+        CUDACHECK(cudaEventSynchronize(m_op_events[handler]));
+        if (m_op_base_event_recorded) {
+            CUDACHECK(cudaEventElapsedTime(&elapsed_ms, m_op_base_event, m_op_events[handler]));
+        }
+        CUDACHECK(cudaEventDestroy(m_op_events[handler]));
+        m_op_events[handler] = nullptr;
+    }
+    return elapsed_ms;
+}
+
+void Communicator::clearEvents() {
+    for (auto &event : m_op_events) {
+        if (event != nullptr) {
+            CUDACHECK(cudaEventDestroy(event));
+            event = nullptr;
+        }
+    }
+    m_op_events.clear();
+    m_op_base_event_recorded = false;
+    for (int i = 0; i < m_num_comms; i++) {
+        m_sync_flags[i] = true;
     }
 }
 
@@ -198,32 +244,48 @@ int Communicator::bcast(torch::Tensor tensor, int root) {
     return current_comm;
 }
 
-void Communicator::reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_tensor) {
-    ncclDataType_t nccl_type;
-    if (torch::kFloat32 == send_tensor.dtype()) {
-        nccl_type = ncclFloat;
-        NCCLCHECK(ncclReduceScatter(send_tensor.data_ptr<float>(), recv_tensor.data_ptr<float>(), recv_tensor.numel(), ncclFloat, ncclSum, m_nccl_comms[m_current_comm], m_streams[m_current_comm]));
-    } else if (torch::kInt64 == send_tensor.dtype()) {
-        nccl_type = ncclInt64;
-        NCCLCHECK(ncclReduceScatter(send_tensor.data_ptr<long>(), recv_tensor.data_ptr<long>(), recv_tensor.numel(), ncclInt64, ncclSum, m_nccl_comms[m_current_comm], m_streams[m_current_comm]));
+int Communicator::reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_tensor) {
+    int current_comm = m_current_comm;
+    if (!m_op_base_event_recorded) {
+        CUDACHECK(cudaEventRecord(m_op_base_event, m_streams[current_comm]));
+        m_op_base_event_recorded = true;
     }
-    //CUDACHECK(cudaEventRecord(m_events[m_current_comm], m_streams[m_current_comm]));
+    if (torch::kFloat32 == send_tensor.dtype()) {
+        NCCLCHECK(ncclReduceScatter(send_tensor.data_ptr<float>(), recv_tensor.data_ptr<float>(), recv_tensor.numel(), ncclFloat, ncclSum, m_nccl_comms[current_comm], m_streams[current_comm]));
+    } else if (torch::kInt64 == send_tensor.dtype()) {
+        NCCLCHECK(ncclReduceScatter(send_tensor.data_ptr<long>(), recv_tensor.data_ptr<long>(), recv_tensor.numel(), ncclInt64, ncclSum, m_nccl_comms[current_comm], m_streams[current_comm]));
+    }
+    cudaEvent_t event;
+    CUDACHECK(cudaEventCreate(&event));
+    CUDACHECK(cudaEventRecord(event, m_streams[current_comm]));
+    m_op_events.push_back(event);
+    int handler = static_cast<int>(m_op_events.size()) - 1;
     m_current_comm++;
     m_current_comm %= m_num_comms;
+    m_sync_flags[current_comm] = false;
+    return handler;
 }
 
-void Communicator::allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor) {
-    ncclDataType_t nccl_type;
-    if (torch::kFloat32 == send_tensor.dtype()) {
-        nccl_type = ncclFloat;
-        NCCLCHECK(ncclAllGather(send_tensor.data_ptr<float>(), recv_tensor.data_ptr<float>(), send_tensor.numel(), ncclFloat, m_nccl_comms[m_current_comm], m_streams[m_current_comm]));
-    } else if (torch::kInt64 == send_tensor.dtype()) {
-        nccl_type = ncclInt64;
-        NCCLCHECK(ncclAllGather(send_tensor.data_ptr<long>(), recv_tensor.data_ptr<long>(), send_tensor.numel(), ncclInt64, m_nccl_comms[m_current_comm], m_streams[m_current_comm]));
+int Communicator::allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor) {
+    int current_comm = m_current_comm;
+    if (!m_op_base_event_recorded) {
+        CUDACHECK(cudaEventRecord(m_op_base_event, m_streams[current_comm]));
+        m_op_base_event_recorded = true;
     }
-    //CUDACHECK(cudaEventRecord(m_events[m_current_comm], m_streams[m_current_comm]));
+    if (torch::kFloat32 == send_tensor.dtype()) {
+        NCCLCHECK(ncclAllGather(send_tensor.data_ptr<float>(), recv_tensor.data_ptr<float>(), send_tensor.numel(), ncclFloat, m_nccl_comms[current_comm], m_streams[current_comm]));
+    } else if (torch::kInt64 == send_tensor.dtype()) {
+        NCCLCHECK(ncclAllGather(send_tensor.data_ptr<long>(), recv_tensor.data_ptr<long>(), send_tensor.numel(), ncclInt64, m_nccl_comms[current_comm], m_streams[current_comm]));
+    }
+    cudaEvent_t event;
+    CUDACHECK(cudaEventCreate(&event));
+    CUDACHECK(cudaEventRecord(event, m_streams[current_comm]));
+    m_op_events.push_back(event);
+    int handler = static_cast<int>(m_op_events.size()) - 1;
     m_current_comm++;
     m_current_comm %= m_num_comms;
+    m_sync_flags[current_comm] = false;
+    return handler;
 }
 
 void Communicator::allReduceRB(torch::Tensor tensor) {

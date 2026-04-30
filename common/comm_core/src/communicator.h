@@ -61,8 +61,8 @@ public:
 	int reduce(torch::Tensor tensor, int root);
 	int bcast(torch::Tensor tensor, int root);
 
-	void reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_tensor);
-	void allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor);
+	int reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_tensor);
+	int allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor);
 	void allReduce(torch::Tensor tensor);
 	void allReduceRB(torch::Tensor tensor);
 	void allReduceRSAG(torch::Tensor tensor);
@@ -74,6 +74,9 @@ public:
     void barrier();
     void synchronize();
     void syncStream(int handler);
+    void syncEvent(int handler);
+    float syncEventElapsedFromBase(int handler);
+    void clearEvents();
 
     int getNumOfFreeStreams();
     void _extendComms(int n_comms);
@@ -81,11 +84,14 @@ public:
 private:
     //ncclUniqueId m_nccl_id;
     //ncclComm_t m_nccl_comm;
-	//cudaStream_t m_stream;
+    //cudaStream_t m_stream;
     ncclUniqueId* m_nccl_ids;
     ncclComm_t* m_nccl_comms;
-	cudaStream_t* m_streams;
+    cudaStream_t* m_streams;
     std::vector<at::cuda::CUDAStream> m_torchstreams;
+    std::vector<cudaEvent_t> m_op_events;
+    cudaEvent_t m_op_base_event;
+    bool m_op_base_event_recorded;
     cudaEvent_t *m_events;
     bool m_destroyed;
     bool* m_sync_flags;

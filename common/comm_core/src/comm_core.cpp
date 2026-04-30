@@ -32,6 +32,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("synchronize", &Communicator::synchronize)
         .def("barrier", &Communicator::barrier)
         .def("syncStream", &Communicator::syncStream)
+        .def("syncEvent", &Communicator::syncEvent)
+        .def("syncEventElapsedFromBase", &Communicator::syncEventElapsedFromBase)
+        .def("clearEvents", &Communicator::clearEvents)
         .def("getNumOfFreeStreams", &Communicator::getNumOfFreeStreams)
         .def("__repr__", [](const Communicator &a) { return "Communicator"; });
 
