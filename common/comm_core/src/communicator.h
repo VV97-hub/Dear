@@ -76,6 +76,7 @@ public:
     void syncStream(int handler);
     void syncEvent(int handler);
     float syncEventElapsedFromBase(int handler);
+    std::vector<float> syncEventElapsedRangeFromBase(int handler);
     void clearEvents();
 
     int getNumOfFreeStreams();
@@ -89,6 +90,7 @@ private:
     ncclComm_t* m_nccl_comms;
     cudaStream_t* m_streams;
     std::vector<at::cuda::CUDAStream> m_torchstreams;
+    std::vector<cudaEvent_t> m_op_start_events;
     std::vector<cudaEvent_t> m_op_events;
     cudaEvent_t m_op_base_event;
     bool m_op_base_event_recorded;

@@ -497,8 +497,10 @@ class CommReduceScatter:
     def synchronize_handle(self, handle):
         if handle is None:
             return None
+        if hasattr(self.merged_comm, 'syncEventElapsedRangeFromBase'):
+            return tuple(self.merged_comm.syncEventElapsedRangeFromBase(handle))
         if hasattr(self.merged_comm, 'syncEventElapsedFromBase'):
-            return self.merged_comm.syncEventElapsedFromBase(handle)
+            return (None, self.merged_comm.syncEventElapsedFromBase(handle))
         if hasattr(self.merged_comm, 'syncEvent'):
             self.merged_comm.syncEvent(handle)
             return None

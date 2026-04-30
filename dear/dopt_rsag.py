@@ -87,6 +87,7 @@ class OverlapProfiler(object):
             'rs_issue_ts': None,
             'rs_complete_wait_start_ts': None,
             'rs_complete_ts': None,
+            'rs_start_cuda_ts': None,
             'rs_complete_cuda_ts': None,
             'rs_global_release_ts': None,
             'ag_issue_ts': None,
@@ -294,14 +295,20 @@ class OverlapProfiler(object):
         for group_idx, group_trace in sorted(self.current.get('group_traces', {}).items()):
             group_trace['rs_global_release_ts'] = end_ts
 
-    def note_rs_complete(self, group_idx=None, start_ts=None, end_ts=None, cuda_elapsed_ms=None):
+    def note_rs_complete(self, group_idx=None, start_ts=None, end_ts=None,
+                         cuda_start_elapsed_ms=None, cuda_elapsed_ms=None):
         if not self.enabled or self.current is None:
             return
         if end_ts is None:
             end_ts = time.perf_counter()
         if start_ts is None:
             start_ts = end_ts
+        cuda_start_ts = None
         cuda_complete_ts = None
+        rs_base_ts = self.current.get('rs_first_launch_ts')
+        if cuda_start_elapsed_ms is not None and cuda_start_elapsed_ms >= 0.0:
+            if rs_base_ts is not None:
+                cuda_start_ts = rs_base_ts + float(cuda_start_elapsed_ms) / 1000.0
         if cuda_elapsed_ms is not None and cuda_elapsed_ms >= 0.0:
             rs_base_ts = self.current.get('rs_first_launch_ts')
             if rs_base_ts is not None:
@@ -310,6 +317,7 @@ class OverlapProfiler(object):
         if group_trace is not None and group_trace['rs_complete_ts'] is None:
             group_trace['rs_complete_wait_start_ts'] = start_ts
             group_trace['rs_complete_ts'] = end_ts
+            group_trace['rs_start_cuda_ts'] = cuda_start_ts
             group_trace['rs_complete_cuda_ts'] = cuda_complete_ts
         self._append_event(
             self.current,
@@ -435,6 +443,7 @@ class OverlapProfiler(object):
                 'rs_issue_ts',
                 'rs_complete_wait_start_ts',
                 'rs_complete_ts',
+                'rs_start_cuda_ts',
                 'rs_complete_cuda_ts',
                 'rs_global_release_ts',
                 'ag_issue_ts',
@@ -459,6 +468,15 @@ class OverlapProfiler(object):
             if item.get('rs_issue_ts') is not None and item.get('rs_complete_cuda_ts') is not None:
                 item['rs_issue_to_complete_cuda_s'] = max(
                     0.0, item['rs_complete_cuda_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_issue_ts') is not None and item.get('rs_start_cuda_ts') is not None:
+                item['rs_issue_to_start_cuda_s'] = max(
+                    0.0, item['rs_start_cuda_ts'] - item['rs_issue_ts']
+                )
+                item['rs_queue_wait_cuda_s'] = item['rs_issue_to_start_cuda_s']
+            if item.get('rs_start_cuda_ts') is not None and item.get('rs_complete_cuda_ts') is not None:
+                item['rs_start_to_complete_cuda_s'] = max(
+                    0.0, item['rs_complete_cuda_ts'] - item['rs_start_cuda_ts']
                 )
             if item.get('rs_complete_wait_start_ts') is not None and item.get('rs_complete_ts') is not None:
                 item['rs_completion_wait_s'] = max(
@@ -1445,11 +1463,21 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 if handle is None:
                     continue
                 rs_group_wait_start = time.perf_counter()
-                cuda_elapsed_ms = reduce_scatter_comm.synchronize_handle(handle)
+                cuda_elapsed = reduce_scatter_comm.synchronize_handle(handle)
+                cuda_start_elapsed_ms = None
+                cuda_elapsed_ms = None
+                if isinstance(cuda_elapsed, (tuple, list)):
+                    if len(cuda_elapsed) > 0:
+                        cuda_start_elapsed_ms = cuda_elapsed[0]
+                    if len(cuda_elapsed) > 1:
+                        cuda_elapsed_ms = cuda_elapsed[1]
+                else:
+                    cuda_elapsed_ms = cuda_elapsed
                 self._overlap_profiler.note_rs_complete(
                     group_idx=group_idx,
                     start_ts=rs_group_wait_start,
                     end_ts=time.perf_counter(),
+                    cuda_start_elapsed_ms=cuda_start_elapsed_ms,
                     cuda_elapsed_ms=cuda_elapsed_ms,
                 )
             reduce_scatter_comm.clear_synchronized()
