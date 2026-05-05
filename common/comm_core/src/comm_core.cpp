@@ -1,6 +1,5 @@
 #include <torch/extension.h>
 #include <pybind11/functional.h>
-#include <pybind11/stl.h>
 
 #include <iostream>
 #include <vector>
@@ -35,7 +34,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("syncStream", &Communicator::syncStream)
         .def("syncEvent", &Communicator::syncEvent)
         .def("syncEventElapsedFromBase", &Communicator::syncEventElapsedFromBase)
-        .def("syncEventElapsedRangeFromBase", &Communicator::syncEventElapsedRangeFromBase)
         .def("clearEvents", &Communicator::clearEvents)
         .def("getNumOfFreeStreams", &Communicator::getNumOfFreeStreams)
         .def("__repr__", [](const Communicator &a) { return "Communicator"; });

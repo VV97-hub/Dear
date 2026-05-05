@@ -113,13 +113,6 @@ void Communicator::_init() {
 }
 
 void Communicator::destroy() {
-    for (auto &event : m_op_start_events) {
-        if (event != nullptr) {
-            CUDACHECK(cudaEventDestroy(event));
-            event = nullptr;
-        }
-    }
-    m_op_start_events.clear();
     for (auto &event : m_op_events) {
         if (event != nullptr) {
             CUDACHECK(cudaEventDestroy(event));
@@ -180,52 +173,25 @@ void Communicator::syncStream(int handler) {
 void Communicator::syncEvent(int handler) {
     if (handler >= 0 && handler < static_cast<int>(m_op_events.size()) && m_op_events[handler] != nullptr) {
         CUDACHECK(cudaEventSynchronize(m_op_events[handler]));
-        if (handler < static_cast<int>(m_op_start_events.size()) && m_op_start_events[handler] != nullptr) {
-            CUDACHECK(cudaEventDestroy(m_op_start_events[handler]));
-            m_op_start_events[handler] = nullptr;
-        }
         CUDACHECK(cudaEventDestroy(m_op_events[handler]));
         m_op_events[handler] = nullptr;
     }
 }
 
 float Communicator::syncEventElapsedFromBase(int handler) {
-    std::vector<float> elapsed_range_ms = syncEventElapsedRangeFromBase(handler);
-    if (elapsed_range_ms.size() >= 2) {
-        return elapsed_range_ms[1];
-    }
-    return -1.0f;
-}
-
-std::vector<float> Communicator::syncEventElapsedRangeFromBase(int handler) {
-    float start_elapsed_ms = -1.0f;
-    float complete_elapsed_ms = -1.0f;
+    float elapsed_ms = -1.0f;
     if (handler >= 0 && handler < static_cast<int>(m_op_events.size()) && m_op_events[handler] != nullptr) {
         CUDACHECK(cudaEventSynchronize(m_op_events[handler]));
         if (m_op_base_event_recorded) {
-            if (handler < static_cast<int>(m_op_start_events.size()) && m_op_start_events[handler] != nullptr) {
-                CUDACHECK(cudaEventElapsedTime(&start_elapsed_ms, m_op_base_event, m_op_start_events[handler]));
-            }
-            CUDACHECK(cudaEventElapsedTime(&complete_elapsed_ms, m_op_base_event, m_op_events[handler]));
-        }
-        if (handler < static_cast<int>(m_op_start_events.size()) && m_op_start_events[handler] != nullptr) {
-            CUDACHECK(cudaEventDestroy(m_op_start_events[handler]));
-            m_op_start_events[handler] = nullptr;
+            CUDACHECK(cudaEventElapsedTime(&elapsed_ms, m_op_base_event, m_op_events[handler]));
         }
         CUDACHECK(cudaEventDestroy(m_op_events[handler]));
         m_op_events[handler] = nullptr;
     }
-    return {start_elapsed_ms, complete_elapsed_ms};
+    return elapsed_ms;
 }
 
 void Communicator::clearEvents() {
-    for (auto &event : m_op_start_events) {
-        if (event != nullptr) {
-            CUDACHECK(cudaEventDestroy(event));
-            event = nullptr;
-        }
-    }
-    m_op_start_events.clear();
     for (auto &event : m_op_events) {
         if (event != nullptr) {
             CUDACHECK(cudaEventDestroy(event));
@@ -284,9 +250,6 @@ int Communicator::reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_te
         CUDACHECK(cudaEventRecord(m_op_base_event, m_streams[current_comm]));
         m_op_base_event_recorded = true;
     }
-    cudaEvent_t start_event;
-    CUDACHECK(cudaEventCreate(&start_event));
-    CUDACHECK(cudaEventRecord(start_event, m_streams[current_comm]));
     if (torch::kFloat32 == send_tensor.dtype()) {
         NCCLCHECK(ncclReduceScatter(send_tensor.data_ptr<float>(), recv_tensor.data_ptr<float>(), recv_tensor.numel(), ncclFloat, ncclSum, m_nccl_comms[current_comm], m_streams[current_comm]));
     } else if (torch::kInt64 == send_tensor.dtype()) {
@@ -295,7 +258,6 @@ int Communicator::reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_te
     cudaEvent_t event;
     CUDACHECK(cudaEventCreate(&event));
     CUDACHECK(cudaEventRecord(event, m_streams[current_comm]));
-    m_op_start_events.push_back(start_event);
     m_op_events.push_back(event);
     int handler = static_cast<int>(m_op_events.size()) - 1;
     m_current_comm++;
@@ -310,9 +272,6 @@ int Communicator::allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor
         CUDACHECK(cudaEventRecord(m_op_base_event, m_streams[current_comm]));
         m_op_base_event_recorded = true;
     }
-    cudaEvent_t start_event;
-    CUDACHECK(cudaEventCreate(&start_event));
-    CUDACHECK(cudaEventRecord(start_event, m_streams[current_comm]));
     if (torch::kFloat32 == send_tensor.dtype()) {
         NCCLCHECK(ncclAllGather(send_tensor.data_ptr<float>(), recv_tensor.data_ptr<float>(), send_tensor.numel(), ncclFloat, m_nccl_comms[current_comm], m_streams[current_comm]));
     } else if (torch::kInt64 == send_tensor.dtype()) {
@@ -321,7 +280,6 @@ int Communicator::allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor
     cudaEvent_t event;
     CUDACHECK(cudaEventCreate(&event));
     CUDACHECK(cudaEventRecord(event, m_streams[current_comm]));
-    m_op_start_events.push_back(start_event);
     m_op_events.push_back(event);
     int handler = static_cast<int>(m_op_events.size()) - 1;
     m_current_comm++;
