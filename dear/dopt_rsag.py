@@ -809,6 +809,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._module_group_flags = [0]*len(module_groups) # check whether module group is gathered
         self._param_group_flags = [[0]*len(g) for g in param_groups] # check whether param group is ready
         self._rs_group_handles = [None] * self._num_groups
+        self._compression_param_groups = param_groups
+        self._param_by_name = {}
         topology_module_groups = [
             [self._module_names[module] for module in module_group]
             for module_group in module_groups
@@ -861,6 +863,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     module_name = self._module_names[module]
                     for p in self._module_direct_parameters[module_name]:
                         name = self._param_names[p]
+                        self._param_by_name[name] = p
                         use_low_rank = True
                         if hasattr(self._compression, 'should_compress_tensor'):
                             use_low_rank = self._compression.should_compress_tensor(p, name=name)
@@ -932,6 +935,18 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     'compressed_q_buffer_bytes': int(self._compressed_pad_buffers_q[group_idx].numel() * 4),
                     'compressed_q_buffer_mb': float(self._compressed_pad_buffers_q[group_idx].numel() * 4 / 1024 / 1024),
                 })
+            self._active_compression_layout_step = None
+            self._active_compression_layout_factor = None
+            self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
+            self._active_compressed_param_offsets_q = self._compressed_param_offsets_q
+            self._active_compressed_group_sizes_p = compressed_group_sizes_p
+            self._active_compressed_group_sizes_q = compressed_group_sizes_q
+            self._active_compressed_padded_group_sizes_p = [
+                buf.numel() for buf in self._compressed_pad_buffers_p
+            ]
+            self._active_compressed_padded_group_sizes_q = [
+                buf.numel() for buf in self._compressed_pad_buffers_q
+            ]
 
         self._overlap_profiler.set_topology(topology_module_groups, group_stats=group_stats)
         
@@ -953,6 +968,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return 'p' if step % 2 == 0 else 'q'
 
     def _compression_offsets_for_factor(self, factor_kind):
+        if hasattr(self, '_active_compressed_param_offsets_p'):
+            if factor_kind == 'p':
+                return self._active_compressed_param_offsets_p
+            return self._active_compressed_param_offsets_q
         if factor_kind == 'p':
             return self._compressed_param_offsets_p
         return self._compressed_param_offsets_q
@@ -961,6 +980,105 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         if factor_kind == 'p':
             return self._compressed_pad_buffers_p, self._compressed_shard_buffers_p
         return self._compressed_pad_buffers_q, self._compressed_shard_buffers_q
+
+    def _active_group_sizes_for_factor(self, factor_kind):
+        if factor_kind == 'p':
+            return self._active_compressed_group_sizes_p, self._active_compressed_padded_group_sizes_p
+        return self._active_compressed_group_sizes_q, self._active_compressed_padded_group_sizes_q
+
+    def _prepare_active_compression_layout(self, step, factor_kind):
+        if not self._compression:
+            return
+        if (
+            self._active_compression_layout_step == step
+            and self._active_compression_layout_factor == factor_kind
+        ):
+            return
+
+        active_offsets_p = {}
+        active_offsets_q = {}
+        group_sizes_p = []
+        group_sizes_q = []
+
+        for group_idx, param_group in enumerate(self._compression_param_groups):
+            offset_p = 0
+            offset_q = 0
+            for name in param_group:
+                p = self._param_by_name[name]
+                use_low_rank = True
+                if hasattr(self._compression, 'should_compress_tensor'):
+                    use_low_rank = self._compression.should_compress_tensor(p, name=name)
+                else:
+                    use_low_rank = p.ndimension() > 1
+
+                if not use_low_rank:
+                    p_size = p.numel()
+                    q_size = p.numel()
+                else:
+                    if hasattr(self._compression, 'get_rank_for_step'):
+                        rank_c = self._compression.get_rank_for_step(name, p.shape, step)
+                    else:
+                        rank_c = self._compression.get_rank_for(name, p.shape)
+                    p_size = self._compression.get_factor_numel(
+                        p.shape, name=name, factor_kind='p', rank=rank_c
+                    )
+                    q_size = self._compression.get_factor_numel(
+                        p.shape, name=name, factor_kind='q', rank=rank_c
+                    )
+
+                active_offsets_p[name] = (group_idx, offset_p, offset_p + p_size)
+                active_offsets_q[name] = (group_idx, offset_q, offset_q + q_size)
+                offset_p += p_size
+                offset_q += q_size
+
+            group_sizes_p.append(offset_p)
+            group_sizes_q.append(offset_q)
+
+        def _padded_sizes(group_sizes, max_buffers):
+            padded = []
+            for group_idx, total_size in enumerate(group_sizes):
+                pad_num = size() - total_size % size()
+                if total_size % size() == 0:
+                    pad_num = 0
+                padded_size = total_size + pad_num
+                if padded_size > max_buffers[group_idx].numel():
+                    raise RuntimeError(
+                        'Active compression buffer overflow at group %d: active=%d max=%d'
+                        % (group_idx, padded_size, max_buffers[group_idx].numel())
+                    )
+                padded.append(padded_size)
+            return padded
+
+        self._active_compressed_param_offsets_p = active_offsets_p
+        self._active_compressed_param_offsets_q = active_offsets_q
+        self._active_compressed_group_sizes_p = group_sizes_p
+        self._active_compressed_group_sizes_q = group_sizes_q
+        self._active_compressed_padded_group_sizes_p = _padded_sizes(
+            group_sizes_p, self._compressed_pad_buffers_p
+        )
+        self._active_compressed_padded_group_sizes_q = _padded_sizes(
+            group_sizes_q, self._compressed_pad_buffers_q
+        )
+        self._active_compression_layout_step = step
+        self._active_compression_layout_factor = factor_kind
+
+    def _compression_group_buffer_views_for_factor(self, factor_kind, group_idx):
+        pad_buffers, shard_buffers = self._compression_buffers_for_factor(factor_kind)
+        _, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
+        padded_size = padded_sizes[group_idx]
+        shard_size = padded_size // size()
+        return (
+            pad_buffers[group_idx][:padded_size],
+            shard_buffers[group_idx][:shard_size],
+        )
+
+    def _zero_active_padding_for_factor(self, factor_kind, group_idx):
+        pad_buffers, _ = self._compression_buffers_for_factor(factor_kind)
+        group_sizes, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
+        total_size = group_sizes[group_idx]
+        padded_size = padded_sizes[group_idx]
+        if padded_size > total_size:
+            pad_buffers[group_idx][total_size:padded_size].zero_()
 
     def profile_step_begin(self):
         self._overlap_profiler.begin_step(self._num_steps)
@@ -1065,6 +1183,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
             if self._compression and self._num_steps > self._compression.warmup_steps:
                 factor_kind = self._compression_factor_kind(self._num_steps)
+                self._prepare_active_compression_layout(self._num_steps, factor_kind)
                 compressed_offsets = self._compression_offsets_for_factor(factor_kind)
                 compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(factor_kind)
 
@@ -1092,11 +1211,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                             return
                     # 全部 ready，触发通信（用压缩 buffer）
                     comm_name = 'reduceScatter-group-%d' % group_idx
+                    self._zero_active_padding_for_factor(factor_kind, group_idx)
+                    pad_view, shard_view = self._compression_group_buffer_views_for_factor(
+                        factor_kind, group_idx
+                    )
                     self._overlap_profiler.note_rs_ready(group_idx=group_idx)
                     handle = reduce_scatter_comm.collective_async_(
                         comm_name,
-                        compressed_pad_buffers[group_idx],
-                        compressed_shard_buffers[group_idx],
+                        pad_view,
+                        shard_view,
                         profiler=self._overlap_profiler,
                         group_idx=group_idx,
                     )
@@ -1224,6 +1347,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             name = self._param_names.get(p)
 
             if self._active_compression_factor is not None:
+                self._prepare_active_compression_layout(
+                    self._num_steps - 1, self._active_compression_factor
+                )
                 compressed_offsets = self._compression_offsets_for_factor(self._active_compression_factor)
                 compressed_pad_buffers, _ = self._compression_buffers_for_factor(self._active_compression_factor)
                 _, start, end = compressed_offsets[name]
@@ -1402,13 +1528,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     
     def _allgather_one_group(self, group_idx):
         if self._active_compression_factor is not None:
-            compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(
-                self._active_compression_factor
+            pad_view, shard_view = self._compression_group_buffer_views_for_factor(
+                self._active_compression_factor, group_idx
             )
             all_gather_comm.collective_async_(
                 "allGather-group-%d" % group_idx,
-                compressed_pad_buffers[group_idx],
-                compressed_shard_buffers[group_idx],
+                pad_view,
+                shard_view,
                 profiler=self._overlap_profiler,
                 group_idx=group_idx,
             )
@@ -1464,6 +1590,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         if self._compression and self._num_steps > self._compression.warmup_steps:
             self._active_compression_factor = self._compression_factor_kind(self._num_steps)
+            self._prepare_active_compression_layout(
+                self._num_steps, self._active_compression_factor
+            )
         else:
             self._active_compression_factor = None
         

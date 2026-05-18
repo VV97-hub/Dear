@@ -92,14 +92,14 @@ parser.add_argument('--overlap-timeline-output', type=str, default='',
 parser.add_argument('--overlap-console', type=int, default=1,
                     help='whether to print overlap summary to console: 1 or 0')
 # 动态rank增加：
-parser.add_argument('--compress-rank', type=int, default=8)
+parser.add_argument('--compress-rank', type=int, default=16)
 parser.add_argument('--compress-rank-overrides', type=str, default='',
                     help='comma-separated parameter-specific rank overrides, e.g. name=32,other=16')
-parser.add_argument('--compress-warmup', type=int, default=500)
+parser.add_argument('--compress-warmup', type=int, default=50)
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
-parser.add_argument('--rank-schedule', type=str, default=None,
+parser.add_argument('--rank-schedule', type=str, default='aggressive',
                     choices=[None, 'aggressive', 'gentle','cosine','warmup_decay'])
 parser.add_argument('--local-rank', type=int, default=0)
 
@@ -126,15 +126,23 @@ os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
 # rank动态变化预设方案映射
 RANK_SCHEDULES = {
     None:        None,
-    'aggressive': {0: 8, 300: 6, 5000: 4},
-    'gentle':     {0: 8, 5000: 6, 20000: 4},
+    'aggressive': {
+        0: args.compress_rank,
+        args.compress_warmup + 250: max(1, round(args.compress_rank * 0.75)),
+        args.compress_warmup + 450: max(1, args.compress_rank // 2),
+    },
+    'gentle': {
+        0: args.compress_rank,
+        args.compress_warmup + 5000: max(1, round(args.compress_rank * 0.75)),
+        args.compress_warmup + 20000: max(1, args.compress_rank // 2),
+    },
     # 自定义复杂机制：用函数表达任意逻辑
-    'cosine':     lambda step: max(1, round(4 * 0.5 * (1 + math.cos(math.pi * step / 10000)))),
-    # step=0 → rank=4，step=5000 → rank=2，step=10000 → rank=1，余弦平滑衰减
+    'cosine':     lambda step: max(1, round(args.compress_rank * 0.5 * (1 + math.cos(math.pi * step / 10000)))),
+    # step=0 → max rank，step=5000 → half rank，step=10000 → rank=1，余弦平滑衰减
     
     'warmup_decay': lambda step: (
-        4 if step < args.compress_warmup          # 热身阶段高rank
-        else max(1, 4 - step // 3000)  # 之后线性衰减
+        args.compress_rank if step < args.compress_warmup          # 热身阶段高rank
+        else max(1, args.compress_rank - step // 3000)  # 之后线性衰减
     ),
 }
 

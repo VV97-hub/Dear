@@ -36,8 +36,8 @@ class Reducer:
 class HalfRankKReducer(Reducer):
     """
     动态rank版本的HalfRankK压缩器。
-    支持按训练阶段动态切换rank，rank变化时自动重建p/q内存，
-    避免形状不匹配导致的crash。
+    采用 nested subspace: 每个张量持久维护最大rank的P/Q母空间，
+    当前rank只使用前r列，rank变化时不重建P/Q和residual。
     """
 
     def __init__(self, random_seed=0, device=None, timer=None, rank=2,
@@ -71,15 +71,19 @@ class HalfRankKReducer(Reducer):
                 self.rank_overrides[name.strip().lower()] = int(value)
 
         # ---- 每个tensor key的内存 ----
-        self.p_memory = {}          # {key: Tensor(n, rank)}
-        self.q_memory = {}          # {key: Tensor(m, rank)}
+        # Nested subspace: P/Q 按该张量可能出现的最大rank分配，当前rank只使用前r列。
+        self.p_memory = {}          # {key: Tensor(n, max_rank)}
+        self.q_memory = {}          # {key: Tensor(m, max_rank)}
         self.residuals = {}         # {key: Tensor(n, m)}  Error Feedback残差
         self.last_input = {}        # {key: Tensor(n, m)}  保留调试信息
 
         # 记录每个key上次使用的rank，用于检测rank是否发生变化
         # 结构：{key: int}
-        # compress写入，decompress读取，保证二者使用完全相同的rank
+        # compress写入，decompress读取，保证二者使用完全相同的active rank
         self.rank_memory = {}
+        self.max_rank_memory = {}
+        self.residual_norms = {}
+        self.grad_norms = {}
 
         self.name = 'halfrankk'
 
@@ -181,28 +185,30 @@ class HalfRankKReducer(Reducer):
         # rank不能超过矩阵的任意一维，也不能为0
         """
 
-        return max(1, min(n, m, base_rank))
+        max_allowed_rank = self.max_rank_for(name)
+        return max(1, min(n, m, max_allowed_rank, base_rank))
         
 
     # ------------------------------------------------------------------
-    # 工具方法：检测rank是否变化，如果变化则清除该key的全部内存
+    # 工具方法：记录rank变化。Nested subspace下不清除P/Q/residual。
     # ------------------------------------------------------------------
-    def _maybe_reset_memory(self, key, new_rank):
+    def _maybe_reset_memory(self, key, new_rank, step=None, name=None):
         """
-        如果当前key的rank与上次不同，说明调度器切换了阶段。
-        此时必须清除p_memory、q_memory、residuals、last_input，
-        否则旧shape的tensor会在新rank下引发矩阵乘法形状不匹配错误。
-
-        rank变化时residual也必须清零，因为旧rank下累积的残差
-        对新rank的p/q基底没有意义，强行保留会污染梯度。
+        Nested subspace使用固定最大rank母空间，当前rank只是active列数。
+        因此rank变化时不能清除P/Q和residual，否则会破坏子空间连续性和EF累积。
         """
         old_rank = self.rank_memory.get(key, None)
-        if old_rank is not None and old_rank != new_rank:
-            # rank发生切换，清除该key的全部历史内存
-            self.p_memory.pop(key, None)
-            self.q_memory.pop(key, None)
-            self.residuals.pop(key, None)    # 残差随rank清零，防止梯度污染
-            self.last_input.pop(key, None)
+        try:
+            worker_rank = torch.distributed.get_rank()
+        except Exception:
+            worker_rank = 0
+        if old_rank != new_rank and worker_rank == 0:
+            label = name if name is not None else key[0]
+            print(
+                "[DynamicRank] step=%s name=%s rank=%s -> %s"
+                % (step, label, old_rank, new_rank),
+                flush=True,
+            )
         # 记录本轮rank，供decompress同步读取
         self.rank_memory[key] = new_rank
 
@@ -240,6 +246,15 @@ class HalfRankKReducer(Reducer):
             return self.default_rank
         return max(self.rank_schedule.values())
 
+    def get_rank_for_step(self, name, shape, step):
+        if not self.should_compress_shape(shape, name=name):
+            return None
+        n = int(shape[0])
+        m = 1
+        for dim in shape[1:]:
+            m *= int(dim)
+        return self._get_rank(step, n, m, name=name)
+
     def get_rank_for(self, name, shape):
         """
         供外部（dopt_rsag）查询某个tensor当前实际使用的rank。
@@ -248,6 +263,10 @@ class HalfRankKReducer(Reducer):
         """
         key = (name, tuple(shape))
         return self.rank_memory.get(key, self.max_rank_for(name))
+
+    def get_factor_numel_for_step(self, shape, name=None, factor_kind='p', step=0):
+        rank = self.get_rank_for_step(name, shape, step)
+        return self.get_factor_numel(shape, name=name, factor_kind=factor_kind, rank=rank)
 
     def get_factor_numel(self, shape, name=None, factor_kind='p', rank=None):
         if not self.should_compress_shape(shape, name=name):
@@ -280,6 +299,11 @@ class HalfRankKReducer(Reducer):
         except RuntimeError:
             orthogonalize(factor)
 
+    def _orthogonalize_new_columns(self, factor, old_rank, new_rank):
+        if new_rank <= old_rank:
+            return
+        self._orthogonalize_factor(factor[:, :new_rank])
+
     def set_random(self, vector):
         torch.manual_seed(self.rng.randint(1_000_000_000))
         vector.data[:] = torch.randn(*vector.shape, device=self.device)
@@ -291,8 +315,8 @@ class HalfRankKReducer(Reducer):
 
         动态rank逻辑：
           - 每次调用先通过_get_rank计算本轮rank；
-          - 若rank与上次不同，_maybe_reset_memory会清空该key的所有历史；
-          - 之后按新rank重新初始化p/q，流程与固定rank完全一致。
+          - P/Q按max_rank持久保存，当前rank只使用前r列；
+          - rank变化不清空residual，从而保留Error Feedback语义。
         """
         if not self.should_compress_tensor(tensor, name=name):
             # 一维tensor不压缩（如bias），直接透传
@@ -307,10 +331,12 @@ class HalfRankKReducer(Reducer):
 
         # ---- 动态rank核心：计算本轮rank并按需重建内存 ----
         rank = self._get_rank(step, n, m, name=name)
+        max_rank = max(1, min(n, m, self.max_rank_for(name)))
         # key同时包含shape，防止同name不同shape的tensor复用同一内存
         key = (name, tuple(tensor.shape))
-        # 检测rank变化，变化时清除旧内存（含residual）
-        self._maybe_reset_memory(key, rank)
+        old_rank = self.rank_memory.get(key, None)
+        # 记录rank变化；nested subspace下不清除旧内存（含residual）
+        self._maybe_reset_memory(key, rank, step=step, name=name)
         # ---- 动态rank核心结束 ----
 
         # [EF] 初始化residual（首次或rank切换后重建）
@@ -324,34 +350,45 @@ class HalfRankKReducer(Reducer):
         matrix = grad_matrix + residual
         self.last_input[key] = matrix.clone()
 
-        # 初始化p/q内存（首次或rank切换后重建，形状由当前rank决定）
+        # 初始化p/q母空间（首次按最大rank创建，rank变化时复用前缀列）
         if key not in self.p_memory:
-            self.p_memory[key] = torch.zeros(n, rank, device=tensor.device)
-            self.q_memory[key] = torch.zeros(m, rank, device=tensor.device)
-            # ACP-SGD 会为两个因子都保留持久状态；rank 切换后也重新随机化两者，
-            # 避免在 q-step 上用全零的 P 退化成空更新。
+            self.p_memory[key] = torch.zeros(n, max_rank, device=tensor.device)
+            self.q_memory[key] = torch.zeros(m, max_rank, device=tensor.device)
+            self.max_rank_memory[key] = max_rank
             self.set_random(self.p_memory[key])
             self.set_random(self.q_memory[key])
+        elif self.max_rank_memory.get(key) != max_rank:
+            raise RuntimeError(
+                'Nested rank max changed for %s: old=%s new=%s. '
+                'Increase default max rank before training instead of changing it at runtime.'
+                % (name, self.max_rank_memory.get(key), max_rank)
+            )
 
-        p = self.p_memory[key]
-        q = self.q_memory[key]
+        if old_rank is not None and rank > old_rank:
+            self._orthogonalize_new_columns(self.p_memory[key], old_rank, rank)
+            self._orthogonalize_new_columns(self.q_memory[key], old_rank, rank)
+
+        p_full = self.p_memory[key]
+        q_full = self.q_memory[key]
+        p = p_full[:, :rank]
+        q = q_full[:, :rank]
 
         # 压缩计算在no_grad下进行，避免污染反向传播计算图
         with torch.no_grad():
             if self.is_p_step(step):
                 # 偶数步：用当前q投影，计算p = M @ q
                 self._orthogonalize_factor(q)
-                torch.matmul(matrix, q, out=p)
-                self.p_memory[key] = p
-                residual.add_(grad_matrix - p @ q.t())
-                return p.clone(), None, None
+                p.copy_(torch.matmul(matrix, q))
+                reconstructed = p @ q.t()
+                residual.copy_(matrix - reconstructed)
+                return p.contiguous().clone(), None, None
             else:
                 # 奇数步：用当前p投影，计算q = M^T @ p
                 self._orthogonalize_factor(p)
-                torch.matmul(matrix.t(), p, out=q)
-                self.q_memory[key] = q
-                residual.add_(grad_matrix - p @ q.t())
-                return q.clone(), None, None
+                q.copy_(torch.matmul(matrix.t(), p))
+                reconstructed = p @ q.t()
+                residual.copy_(matrix - reconstructed)
+                return q.contiguous().clone(), None, None
 
     def decompress(self, compressed_data, original_tensor_size, numel, name, step=0, factor_kind=None):
         """
@@ -372,8 +409,11 @@ class HalfRankKReducer(Reducer):
             return compressed_data.view(original_tensor_size)
 
         key = (name, tuple(original_tensor_size))
-        p = self.p_memory[key]
-        q = self.q_memory[key]
+        rank = self.rank_memory.get(key, self.max_rank_for(name))
+        p_full = self.p_memory[key]
+        q_full = self.q_memory[key]
+        p = p_full[:, :rank]
+        q = q_full[:, :rank]
 
         if factor_kind is None:
             factor_kind = self.factor_kind_for_update(step)
