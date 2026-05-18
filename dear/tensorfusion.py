@@ -468,11 +468,12 @@ class CommReduceScatter:
 
         self._name_tensors = {}
         self.handles = []
+        self._handles_by_name = {}
     
     def init_tensor_group(self, tensor_names, num_nearby_layers=NUM_NEARBY_LAYERS):
         pass
 
-    def collective_async_(self, name, pad_tensor, shard_tensor):
+    def collective_async_(self, name, pad_tensor, shard_tensor, profiler=None, group_idx=None):
         self._name_tensors[name] = (pad_tensor, shard_tensor)
         # Validation barrier: ensure the compute stream has finished writing the
         # fusion buffers before NCCL starts reading them on the comm stream.
@@ -480,13 +481,40 @@ class CommReduceScatter:
         current_stream.synchronize()
 
         if self.op == CollectiveOp.REDUCE_SCATTER:
+            if profiler is not None:
+                profiler.note_rs_issue(group_idx=group_idx)
             handle = self.merged_comm.reduceScatter(pad_tensor, shard_tensor)
         elif self.op == CollectiveOp.ALL_GATHER:
+            if profiler is not None:
+                profiler.note_ag_issue(group_idx=group_idx)
             handle = self.merged_comm.allGather(shard_tensor, pad_tensor)
         else:
             raise TypeError
         self.handles.append((handle, shard_tensor, pad_tensor))
+        self._handles_by_name[name] = handle
         return handle
+
+    def synchronize_handle(self, handle):
+        if handle is None:
+            return None
+        if hasattr(self.merged_comm, 'syncEventElapsedFromBase'):
+            return self.merged_comm.syncEventElapsedFromBase(handle)
+        if hasattr(self.merged_comm, 'syncEvent'):
+            self.merged_comm.syncEvent(handle)
+            return None
+        else:
+            self.merged_comm.syncStream(handle)
+            return None
+
+    def synchronize_name(self, name):
+        return self.synchronize_handle(self._handles_by_name.get(name))
+
+    def clear_synchronized(self):
+        if hasattr(self.merged_comm, 'clearEvents'):
+            self.merged_comm.clearEvents()
+        self._name_tensors.clear()
+        self.handles.clear()
+        self._handles_by_name.clear()
 
     def synchronize(self):
         self.merged_comm.synchronize()
@@ -494,3 +522,4 @@ class CommReduceScatter:
         # torch.cuda.current_stream().wait_stream(self.merged_comm._current_stream)
         self._name_tensors.clear()
         self.handles.clear()
+        self._handles_by_name.clear()

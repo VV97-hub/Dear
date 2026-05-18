@@ -1,13 +1,18 @@
 #!/bin/bash
 nworkers="${nworkers:-4}"
 bs="${bs:-64}"
-# dnn参数选择模型和数据：cifar10_resnet18   cifar10_vgg16 （真实 CIFAR-10 训练任务——ACP测试精度的） 
+# dnn参数选择模型和数据：cifar10_resnet18/cifar10_vgg16/cifar100_resnet18/cifar100_vgg16 （真实 CIFAR 训练任务——ACP测试精度的） 
 # 原本的实验 bert_base /bert ————> 对应bert_benchmark  dnn=resnet18、dnn=vgg16 走的是 /mnt/c/Users/sg564/Desktop/Dear/dear/imagenet_benchmark.py:1，那是合成数据吞吐测试
-dnn="${dnn:-cifar10_resnet18}"
-data_dir="${data_dir:-./cifar10_data}"
+dnn="${dnn:-bert_base}"
+if [ -z "${data_dir+x}" ]; then # 只有当没有手动设置 data_dir 时，脚本才自动选择数据目录
+    case "$dnn" in
+        cifar100_*) data_dir="./cifar100_data" ;; # 以 cifar100_ 开头的模型，默认数据目录是./cifar100_data
+        *) data_dir="./cifar10_data" ;;  # 其他则默认是./cifar10_data
+    esac
+fi
 download_dataset="${download_dataset:-0}"
 # compressor的选项none、halfrankk、(topk、eftopk，gaussian，signum，efsignum，)
-compressor="${compressor:-none}"
+compressor="${compressor:-halfrankk}"
 senlen="${senlen:-64}"
 rdma="${rdma:-0}"
 nstreams="${nstreams:-1}"
@@ -15,11 +20,11 @@ mgwfbp="${mgwfbp:-0}"
 asc="${asc:-0}"
 threshold="${threshold:-0}"
 exclude_parts="${exclude_parts:-''}"
-overlap_profile="${overlap_profile:-0}"
-overlap_summary="${overlap_summary:-0}"
-overlap_timeline="${overlap_timeline:-1}"
+overlap_profile="${overlap_profile:-0}" # 控制是否打开时间测量
+overlap_summary="${overlap_summary:-0}" # 以前设置的时间总结，但是现在没什么用了
+overlap_timeline="${overlap_timeline:-1}" # 时间线功能打开，现在主要事件分析的工具
 overlap_summary_mode="${overlap_summary_mode:-strict}"
-overlap_timeline_mode="${overlap_timeline_mode:-light}"
+overlap_timeline_mode="${overlap_timeline_mode:-light}" 
 overlap_console="${overlap_console:-0}"
 overlap_log_every="${overlap_log_every:-10}"
 overlap_warmup="${overlap_warmup:-0}"
@@ -123,7 +128,7 @@ append_overlap_args() {
 if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
     benchfile=$(append_overlap_args "$benchfile")
-elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ]; then
+elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn" = "cifar100_resnet18" ] || [ "$dnn" = "cifar100_vgg16" ]; then
     benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts --data-dir $data_dir"
     if [ "$download_dataset" = "1" ]; then
         benchfile="$benchfile --download-dataset"

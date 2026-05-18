@@ -92,12 +92,14 @@ parser.add_argument('--overlap-timeline-output', type=str, default='',
 parser.add_argument('--overlap-console', type=int, default=1,
                     help='whether to print overlap summary to console: 1 or 0')
 # 动态rank增加：
-parser.add_argument('--compress-rank', type=int, default=8)
-parser.add_argument('--compress-warmup', type=int, default=500)
+parser.add_argument('--compress-rank', type=int, default=16)
+parser.add_argument('--compress-rank-overrides', type=str, default='',
+                    help='comma-separated parameter-specific rank overrides, e.g. name=32,other=16')
+parser.add_argument('--compress-warmup', type=int, default=50)
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
-parser.add_argument('--rank-schedule', type=str, default=None,
+parser.add_argument('--rank-schedule', type=str, default='aggressive',
                     choices=[None, 'aggressive', 'gentle','cosine','warmup_decay'])
 parser.add_argument('--local-rank', type=int, default=0)
 
@@ -124,15 +126,23 @@ os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
 # rank动态变化预设方案映射
 RANK_SCHEDULES = {
     None:        None,
-    'aggressive': {0: 8, 300: 6, 5000: 4},
-    'gentle':     {0: 8, 5000: 6, 20000: 4},
+    'aggressive': {
+        0: args.compress_rank,
+        args.compress_warmup + 250: max(1, round(args.compress_rank * 0.75)),
+        args.compress_warmup + 450: max(1, args.compress_rank // 2),
+    },
+    'gentle': {
+        0: args.compress_rank,
+        args.compress_warmup + 5000: max(1, round(args.compress_rank * 0.75)),
+        args.compress_warmup + 20000: max(1, args.compress_rank // 2),
+    },
     # 自定义复杂机制：用函数表达任意逻辑
-    'cosine':     lambda step: max(1, round(4 * 0.5 * (1 + math.cos(math.pi * step / 10000)))),
-    # step=0 → rank=4，step=5000 → rank=2，step=10000 → rank=1，余弦平滑衰减
+    'cosine':     lambda step: max(1, round(args.compress_rank * 0.5 * (1 + math.cos(math.pi * step / 10000)))),
+    # step=0 → max rank，step=5000 → half rank，step=10000 → rank=1，余弦平滑衰减
     
     'warmup_decay': lambda step: (
-        4 if step < args.compress_warmup          # 热身阶段高rank
-        else max(1, 4 - step // 3000)  # 之后线性衰减
+        args.compress_rank if step < args.compress_warmup          # 热身阶段高rank
+        else max(1, args.compress_rank - step // 3000)  # 之后线性衰减
     ),
 }
 
@@ -464,6 +474,7 @@ if hvd.size() > 1:
                                          (device=torch.device('cuda', args.local_rank),
     rank=args.compress_rank,
     rank_schedule=RANK_SCHEDULES[args.rank_schedule],
+    rank_overrides=args.compress_rank_overrides,
     warmup_steps=args.compress_warmup,
     min_compression_numel=args.compress_min_numel,), 
 
@@ -558,7 +569,8 @@ def benchmark_step():
     # 测试NaN的来源 SHAN with torch.autograd.detect_anomaly():
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    forward_start = time.perf_counter()
+    if overlap_enabled and hasattr(optimizer, 'profile_forward_start'):
+        optimizer.profile_forward_start()
     outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_masks)
     prediction_scores = outputs.prediction_logits
     seq_relationship_score = outputs.seq_relationship_logits
@@ -566,7 +578,7 @@ def benchmark_step():
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_forward_done'):
-        optimizer.profile_forward_done(time.perf_counter() - forward_start)
+        optimizer.profile_forward_done()
 
     if hvd.rank() == 0 and step % 5 == 0:
         print("step:",step)
@@ -576,12 +588,11 @@ def benchmark_step():
         optimizer.profile_backward_start()
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    backward_start = time.perf_counter()
     loss.backward()
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_backward_done'):
-        optimizer.profile_backward_done(time.perf_counter() - backward_start)
+        optimizer.profile_backward_done()
     
     optimizer.step()
 
@@ -640,19 +651,12 @@ if overlap_enabled and hasattr(optimizer, 'profile_summary'):
     if hvd.rank() == 0 and args.overlap_console and overlap_summary.get('num_steps', 0) > 0:
         log(
             'Overlap summary: steps=%d, '
-            'forward_total=%.6f s, forward_compute=%.6f s, '
-            'ag_window=%.6f s, ag_overlap=%.6f s, backward_total=%.6f s, '
-            'rs_window=%.6f s, rs_overlap=%.6f s, rs_tail=%.6f s, '
+            'forward_total=%.6f s, backward_total=%.6f s, rs_tail=%.6f s, '
             'ag_wait=%.6f s, update=%.6f s'
             % (
                 overlap_summary['num_steps'],
                 overlap_summary['forward_total_s'],
-                overlap_summary['forward_compute_only_est_s'],
-                overlap_summary['ag_comm_window_s'],
-                overlap_summary['ag_overlap_with_forward_compute_s'],
                 overlap_summary['backward_total_s'],
-                overlap_summary['rs_comm_window_s'],
-                overlap_summary['rs_overlap_with_backward_s'],
                 overlap_summary['rs_tail_wait_s'],
                 overlap_summary['ag_wait_s'],
                 overlap_summary['update_s'],

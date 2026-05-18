@@ -12,10 +12,10 @@ import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.datasets as datasets
-import torchvision.models as tv_models
 import torchvision.transforms as transforms
 
 import dopt_rsag as hvd
+from cifar_models import cifar_resnet18, cifar_vgg16
 from compression import compressors
 
 
@@ -26,18 +26,27 @@ os.environ["HOROVOD_CACHE_CAPACITY"] = "0"
 os.environ["HOROVOD_CYCLE_TIME"] = "0"
 
 parser = argparse.ArgumentParser(
-    description="CIFAR-10 benchmark with VGG-16 and ResNet-18",
+    description="CIFAR-10/100 benchmark with VGG-16 and ResNet-18",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
-parser.add_argument("--model", type=str, default="cifar10_resnet18", choices=["cifar10_resnet18", "cifar10_vgg16"])
+parser.add_argument(
+    "--model",
+    type=str,
+    default="cifar10_resnet18",
+    choices=["cifar10_resnet18", "cifar10_vgg16", "cifar100_resnet18", "cifar100_vgg16"],
+)
 parser.add_argument("--batch-size", type=int, default=128)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--base-lr", type=float, default=0.1)
+parser.add_argument("--warmup-epochs", type=int, default=5)
+parser.add_argument("--lr-decay-epochs", type=str, default="150,220")
+parser.add_argument("--lr-decay-factor", type=float, default=0.1)
 parser.add_argument("--momentum", type=float, default=0.9)
 parser.add_argument("--weight-decay", type=float, default=5e-4)
 parser.add_argument("--workers", type=int, default=4)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--data-dir", type=str, default="./cifar10_data")
+parser.add_argument("--data-dir", type=str, default=None)
+parser.add_argument("--download-dataset", action="store_true", default=False)
 parser.add_argument("--print-freq", type=int, default=50)
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--no-cuda", action="store_true", default=False)
@@ -65,6 +74,10 @@ parser.add_argument("--compress-warmup", type=int, default=1000)
 parser.add_argument("--compress-min-numel", type=int, default=16384)
 parser.add_argument("--rank-schedule", type=str, default=None, choices=[None, "aggressive", "gentle"])
 args = parser.parse_args()
+args.lr_decay_epochs = [int(epoch) for epoch in args.lr_decay_epochs.split(",") if epoch]
+args.dataset = "cifar100" if args.model.startswith("cifar100_") else "cifar10"
+if args.data_dir is None:
+    args.data_dir = "./{}_data".format(args.dataset)
 
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0"))
@@ -99,9 +112,31 @@ if args.cuda:
 
 RANK_SCHEDULES = {
     None: None,
-    "aggressive": {0: args.compress_rank, 6000: max(1, args.compress_rank // 2)},
-    "gentle": {0: args.compress_rank, 12000: max(1, args.compress_rank // 2)},
+    "aggressive": {
+        0: args.compress_rank,
+        args.compress_warmup + 6000: max(1, args.compress_rank // 2),
+    },
+    "gentle": {
+        0: args.compress_rank,
+        args.compress_warmup + 12000: max(1, args.compress_rank // 2),
+    },
 }
+
+DATASET_CONFIGS = {
+    "cifar10": {
+        "class": datasets.CIFAR10,
+        "num_classes": 10,
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+    "cifar100": {
+        "class": datasets.CIFAR100,
+        "num_classes": 100,
+        "mean": (0.5071, 0.4867, 0.4408),
+        "std": (0.2675, 0.2565, 0.2761),
+    },
+}
+dataset_config = DATASET_CONFIGS[args.dataset]
 
 
 # 动态rank的config打印
@@ -114,19 +149,19 @@ print("========================================")
 
 def hvd_barrier():
     token = torch.tensor([1.0], device="cuda" if args.cuda else "cpu")
-    hvd.allreduce(token, name="cifar10_setup_barrier")
+    hvd.allreduce(token, name="{}_setup_barrier".format(args.dataset))
 
 
 def build_model():
-    if args.model == "cifar10_resnet18":
-        return tv_models.resnet18(num_classes=10)
-    return tv_models.vgg16(num_classes=10)
+    if args.model.endswith("_resnet18"):
+        return cifar_resnet18(num_classes=dataset_config["num_classes"])
+    return cifar_vgg16(num_classes=dataset_config["num_classes"])
 
 
 def build_dataloaders():
     normalize = transforms.Normalize(
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2023, 0.1994, 0.2010),
+        mean=dataset_config["mean"],
+        std=dataset_config["std"],
     )
     train_transform = transforms.Compose(
         [
@@ -143,16 +178,17 @@ def build_dataloaders():
         ]
     )
 
+    dataset_class = dataset_config["class"]
     if hvd.rank() == 0:
-        train_dataset = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=train_transform)
-        test_dataset = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=test_transform)
+        train_dataset = dataset_class(root=args.data_dir, train=True, download=True, transform=train_transform)
+        test_dataset = dataset_class(root=args.data_dir, train=False, download=True, transform=test_transform)
     else:
         train_dataset = None
         test_dataset = None
     hvd_barrier()
     if hvd.rank() != 0:
-        train_dataset = datasets.CIFAR10(root=args.data_dir, train=True, download=False, transform=train_transform)
-        test_dataset = datasets.CIFAR10(root=args.data_dir, train=False, download=False, transform=test_transform)
+        train_dataset = dataset_class(root=args.data_dir, train=True, download=False, transform=train_transform)
+        test_dataset = dataset_class(root=args.data_dir, train=False, download=False, transform=test_transform)
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset,
@@ -184,12 +220,17 @@ def build_dataloaders():
     return train_loader, test_loader, train_sampler
 
 
-def adjust_learning_rate(optimizer, epoch):
-    lr = args.base_lr * hvd.size()
-    if epoch >= 100:
-        lr *= 0.1
-    if epoch >= 150:
-        lr *= 0.1
+def adjust_learning_rate(optimizer, epoch, batch_idx, num_batches):
+    lr = args.base_lr
+
+    if args.warmup_epochs > 0 and hvd.size() > 1 and epoch < args.warmup_epochs:
+        epoch_progress = epoch + float(batch_idx + 1) / num_batches
+        lr *= (epoch_progress * (hvd.size() - 1) / args.warmup_epochs + 1.0) / hvd.size()
+
+    for decay_epoch in args.lr_decay_epochs:
+        if epoch >= decay_epoch:
+            lr *= args.lr_decay_factor
+
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
     return lr
@@ -214,10 +255,12 @@ criterion = nn.CrossEntropyLoss()
 if args.cuda:
     criterion.cuda()
 
-lr_scaler = hvd.size() if not args.use_adasum else 1
+initial_lr = args.base_lr
+if args.warmup_epochs > 0 and hvd.size() > 1:
+    initial_lr = args.base_lr / hvd.size()
 optimizer = optim.SGD(
     model.parameters(),
-    lr=args.base_lr * lr_scaler,
+    lr=initial_lr,
     momentum=args.momentum,
     weight_decay=args.weight_decay,
 )
@@ -254,10 +297,10 @@ train_loader, test_loader, train_sampler = build_dataloaders()
 def train_one_epoch(epoch):
     model.train()
     train_sampler.set_epoch(epoch)
-    lr = adjust_learning_rate(optimizer, epoch)
     running_loss = 0.0
 
     for step, (data, target) in enumerate(train_loader, start=1):
+        lr = adjust_learning_rate(optimizer, epoch, step - 1, len(train_loader))
         if args.cuda:
             data = data.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
@@ -299,21 +342,27 @@ def evaluate(epoch):
             sample_total += batch_size
             loss_total += loss.detach() * batch_size
 
-    correct_total = hvd.allreduce(correct_total, name="cifar10_eval_correct")
-    sample_total = hvd.allreduce(sample_total, name="cifar10_eval_samples")
-    loss_total = hvd.allreduce(loss_total, name="cifar10_eval_loss")
+    correct_total = hvd.allreduce(correct_total, name="{}_eval_correct".format(args.dataset))
+    sample_total = hvd.allreduce(sample_total, name="{}_eval_samples".format(args.dataset))
+    loss_total = hvd.allreduce(loss_total, name="{}_eval_loss".format(args.dataset))
     avg_loss = (loss_total / sample_total).item()
     top1 = (correct_total / sample_total * 100.0).item()
     log("Epoch {:03d} validation loss {:.4f} top1 {:.2f}%".format(epoch, avg_loss, top1))
 
 
 log(
-    "CIFAR benchmark start model={} compressor={} batch_size={} workers={} world_size={}".format(
+    "CIFAR benchmark start dataset={} model={} data_dir={} compressor={} batch_size={} workers={} world_size={} base_lr={} warmup_epochs={} decay_epochs={} decay_factor={}".format(
+        args.dataset,
         args.model,
+        args.data_dir,
         args.compressor,
         args.batch_size,
         args.workers,
         hvd.size(),
+        args.base_lr,
+        args.warmup_epochs,
+        args.lr_decay_epochs,
+        args.lr_decay_factor,
     )
 )
 for epoch in range(args.epochs):

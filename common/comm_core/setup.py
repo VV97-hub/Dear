@@ -33,7 +33,7 @@ setup(
                 'src/communicator.cpp',
                 'src/comm_core.cpp',
             ],
-            libraries=['nccl', 'mpi'], # 删去了'mpi_cxx'，应为openmpi4.1.1不用这个了。
+            libraries=['nccl', 'mpi_cxx', 'mpi'],
             library_dirs=['objs', CUDA_DIR+'/lib64', NCCL_DIR+'/lib', MPI_DIR+'/lib'],
             extra_link_args=['-Wl,-rpath,' + MPI_DIR + '/lib'],  # 可选：嵌入运行时路径，防止加载失败
             # extra_compile_args=['-g']
