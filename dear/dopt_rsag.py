@@ -1307,6 +1307,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     group_idx=group_idx,
                     module_name=name,
                 )
+                self._observe_active_compression_group(group_idx)
                 # torch.cuda.synchronize() 
                 # torch.cuda.current_stream().synchronize()
                 # print("Rank %d: Step %d, AllGather group %d time: %.10f sec" % (rank(), self._num_steps, group_idx, ag_time))
@@ -1333,6 +1334,26 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     group_idx=group_idx,
                     module_name=name,
                 )
+
+    def _observe_active_compression_group(self, group_idx):
+        if self._active_compression_factor is None:
+            return
+        if not hasattr(self._compression, 'observe_global_factor_group'):
+            return
+        step = self._num_steps - 1
+        if step <= self._compression.warmup_steps:
+            return
+        self._prepare_active_compression_layout(step, self._active_compression_factor)
+        pad_buffers, _ = self._compression_buffers_for_factor(self._active_compression_factor)
+        group_sizes, _ = self._active_group_sizes_for_factor(self._active_compression_factor)
+        active_size = group_sizes[group_idx]
+        active_buffer = pad_buffers[group_idx][:active_size]
+        self._compression.observe_global_factor_group(
+            active_buffer,
+            step=step,
+            group_idx=group_idx,
+            factor_kind=self._active_compression_factor,
+        )
     
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
@@ -1593,6 +1614,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._prepare_active_compression_layout(
                 self._num_steps, self._active_compression_factor
             )
+            if hasattr(self._compression, 'begin_global_factor_observation'):
+                self._compression.begin_global_factor_observation(
+                    self._num_steps, self._active_compression_factor, self._num_groups
+                )
         else:
             self._active_compression_factor = None
         
