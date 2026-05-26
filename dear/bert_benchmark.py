@@ -99,18 +99,20 @@ parser.add_argument('--compress-warmup', type=int, default=100)
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
-parser.add_argument('--rank-schedule', type=str, default='factor_stable',
-                    choices=[None, 'aggressive', 'gentle','cosine','warmup_decay', 'factor_stable'])
+parser.add_argument('--rank-schedule', type=str, default='update_norm_stable',
+                    choices=[None, 'aggressive', 'gentle','cosine','warmup_decay', 'update_norm_stable'])
 parser.add_argument('--stable-rank-levels', type=str, default='16,12,8',
-                    help='comma-separated rank levels for factor_stable, default derives rank,0.75rank,0.5rank')
-parser.add_argument('--stable-factor-tol', type=float, default=0.15,
-                    help='relative factor-norm change threshold regarded as stable')
-parser.add_argument('--stable-factor-patience', type=int, default=20,
-                    help='number of stable factor observations before dropping to the next rank level')
-parser.add_argument('--stable-factor-smoothing', type=float, default=0.8,
-                    help='EMA smoothing for communicated factor norm in factor_stable schedule')
-parser.add_argument('--stable-factor-debug-every', type=int, default=51, # 设置为0不输出因子波动情况
-                    help='print factor_stable diagnostics every N steps on rank 0; 0 disables')
+                    help='comma-separated rank levels for stable dynamic-rank schedules, default derives rank,0.75rank,0.5rank')
+parser.add_argument('--update-norm-stable-tol', type=float, default=0.05,
+                    help='relative synchronized-update-norm EMA change threshold regarded as stable')
+parser.add_argument('--update-norm-critical-tol', type=float, default=0.8,
+                    help='raw synchronized-update-norm change threshold that resets stability')
+parser.add_argument('--update-norm-patience', type=int, default=20,
+                    help='number of stable synchronized update norm observations before dropping rank')
+parser.add_argument('--update-norm-smoothing', type=float, default=0.8,
+                    help='EMA smoothing for synchronized update norm in update_norm_stable schedule')
+parser.add_argument('--update-norm-debug-every', type=int, default=101,
+                    help='print update_norm_stable diagnostics every N steps on rank 0; 0 disables')
 parser.add_argument('--local-rank', type=int, default=0)
 
 # TODO 打印上面四个值；方便查看
@@ -136,7 +138,7 @@ os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
 # rank动态变化预设方案映射
 RANK_SCHEDULES = {
     None:        None,
-    'factor_stable': None,
+    'update_norm_stable': None,
     'aggressive': {
         0: args.compress_rank,
         args.compress_warmup + 250: max(1, round(args.compress_rank * 0.75)),
@@ -173,12 +175,13 @@ print(f"compress_rank: {args.compress_rank}")
 print(f"compress_warmup: {args.compress_warmup}")
 print(f"compress_min_numel: {args.compress_min_numel}")
 print(f"rank_schedule: {args.rank_schedule}")
-if args.rank_schedule == 'factor_stable':
+if args.rank_schedule == 'update_norm_stable':
     print(f"stable_rank_levels: {args.stable_rank_levels or 'auto'}")
-    print(f"stable_factor_tol: {args.stable_factor_tol}")
-    print(f"stable_factor_patience: {args.stable_factor_patience}")
-    print(f"stable_factor_smoothing: {args.stable_factor_smoothing}")
-    print(f"stable_factor_debug_every: {args.stable_factor_debug_every}")
+    print(f"update_norm_stable_tol: {args.update_norm_stable_tol}")
+    print(f"update_norm_critical_tol: {args.update_norm_critical_tol}")
+    print(f"update_norm_patience: {args.update_norm_patience}")
+    print(f"update_norm_smoothing: {args.update_norm_smoothing}")
+    print(f"update_norm_debug_every: {args.update_norm_debug_every}")
 print(f"local_rank: {args.local_rank}")
 print("========================================")
 
@@ -494,12 +497,13 @@ if hvd.size() > 1:
     rank_overrides=args.compress_rank_overrides,
     warmup_steps=args.compress_warmup,
     min_compression_numel=args.compress_min_numel,
-    factor_stable_rank=args.rank_schedule == 'factor_stable',
+    update_norm_stable_rank=args.rank_schedule == 'update_norm_stable',
     stable_rank_levels=args.stable_rank_levels,
-    stable_factor_tol=args.stable_factor_tol,
-    stable_factor_patience=args.stable_factor_patience,
-    stable_factor_smoothing=args.stable_factor_smoothing,
-    stable_factor_debug_every=args.stable_factor_debug_every,), 
+    update_norm_stable_tol=args.update_norm_stable_tol,
+    update_norm_critical_tol=args.update_norm_critical_tol,
+    update_norm_patience=args.update_norm_patience,
+    update_norm_smoothing=args.update_norm_smoothing,
+    update_norm_debug_every=args.update_norm_debug_every,), 
 
     is_sparse=args.density<1, density=args.density, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=1, threshold=args.threshold, writer=None, gradient_path='./', fp16=args.fp16, mgwfbp=args.mgwfbp, rdma=args.rdma, exclude_parts=args.exclude_parts)
     

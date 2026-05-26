@@ -1329,8 +1329,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 elif self._event_sync_enabled and group_idx == self._num_groups - 1:
                     all_gather_comm.clear_synchronized()
                     self._ag_group_handles = [None] * self._num_groups
-                self._observe_active_compression_group(group_idx)
-
             # update params for this module
             self._update_one_module(module, name, group_idx)
             if sub_idx == 0:
@@ -1349,26 +1347,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     module_name=name,
                 )
 
-    def _observe_active_compression_group(self, group_idx):
-        if self._active_compression_factor is None:
-            return
-        if not hasattr(self._compression, 'observe_global_factor_group'):
-            return
-        step = self._num_steps - 1
-        if step <= self._compression.warmup_steps:
-            return
-        self._prepare_active_compression_layout(step, self._active_compression_factor)
-        pad_buffers, _ = self._compression_buffers_for_factor(self._active_compression_factor)
-        group_sizes, _ = self._active_group_sizes_for_factor(self._active_compression_factor)
-        active_size = group_sizes[group_idx]
-        active_buffer = pad_buffers[group_idx][:active_size]
-        self._compression.observe_global_factor_group(
-            active_buffer,
-            step=step,
-            group_idx=group_idx,
-            factor_kind=self._active_compression_factor,
-        )
-    
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
         # torch.cuda.synchronize()
@@ -1378,6 +1356,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
             torch.cuda.synchronize()
         update_start = time.perf_counter()
+        update_norm_enabled = (
+            self._active_compression_factor is not None
+            and hasattr(self._compression, 'wants_update_norm_observation')
+            and self._compression.wants_update_norm_observation()
+        )
+        group_update_norm_sq_terms = [] if update_norm_enabled else None
         for p in self._module_direct_parameters[module_name]:
             name = self._param_names.get(p)
 
@@ -1423,8 +1407,31 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
             # grad = grad.view(-1)          # 统一 shape
             grad.div_(size())             # ✅ 在局部变量上做，不碰 p.grad
+            if update_norm_enabled:
+                group_update_norm_sq_terms.append(torch.sum(grad.detach().float() ** 2))
             
             self._sgd(p,grad)
+        if update_norm_enabled:
+            if not hasattr(self, '_active_update_norm_group_sums') or self._active_update_norm_group_sums is None:
+                self._active_update_norm_group_sums = {}
+            if group_update_norm_sq_terms:
+                module_update_norm_sq = torch.stack(group_update_norm_sq_terms).sum()
+                prev_norm_sq = self._active_update_norm_group_sums.get(group_idx)
+                if prev_norm_sq is None:
+                    self._active_update_norm_group_sums[group_idx] = module_update_norm_sq
+                else:
+                    self._active_update_norm_group_sums[group_idx] = prev_norm_sq + module_update_norm_sq
+            _, sub_idx = self._module_group_idx[module_name]
+            if sub_idx == self._group_module_counts[group_idx] - 1:
+                group_norm_sq = self._active_update_norm_group_sums.get(group_idx)
+                if group_norm_sq is None:
+                    group_norm_sq = torch.zeros((), device=self._compression.device)
+                self._compression.observe_global_update_norm_group(
+                    group_norm_sq,
+                    step=self._num_steps - 1,
+                    group_idx=group_idx,
+                )
+                self._active_update_norm_group_sums.pop(group_idx, None)
         if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
             torch.cuda.synchronize()
         update_end = time.perf_counter()
@@ -1644,12 +1651,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._prepare_active_compression_layout(
                 self._num_steps, self._active_compression_factor
             )
-            if hasattr(self._compression, 'begin_global_factor_observation'):
-                self._compression.begin_global_factor_observation(
-                    self._num_steps, self._active_compression_factor, self._num_groups
+            self._active_update_norm_group_sums = {}
+            if hasattr(self._compression, 'begin_global_update_norm_observation'):
+                self._compression.begin_global_update_norm_observation(
+                    self._num_steps, self._num_groups
                 )
         else:
             self._active_compression_factor = None
+            self._active_update_norm_group_sums = None
         
         # 第一次调用AG 立即调用group0的AG通信
         self._ag_group_handles = [None] * self._num_groups

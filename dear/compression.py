@@ -43,9 +43,11 @@ class HalfRankKReducer(Reducer):
     def __init__(self, random_seed=0, device=None, timer=None, rank=2,
                  rank_schedule=None, warmup_steps=200,
                  min_compression_numel=16384, rank_overrides=None,
-                 factor_stable_rank=False, stable_rank_levels=None,
-                 stable_factor_tol=0.02, stable_factor_patience=100,
-                 stable_factor_smoothing=0.95, stable_factor_debug_every=0):
+                 update_norm_stable_rank=False,
+                 stable_rank_levels=None,
+                 update_norm_stable_tol=0.01, update_norm_critical_tol=0.3,
+                 update_norm_patience=100, update_norm_smoothing=0.9,
+                 update_norm_debug_every=0):
         """
         参数说明：
           rank          : 默认/初始rank值，当rank_schedule未覆盖当前step时使用。
@@ -58,8 +60,8 @@ class HalfRankKReducer(Reducer):
                              完全自定义，可实现任意调度逻辑。
                           如果为 None，则始终使用 rank 参数（固定rank，兼容旧行为）。
           rank_overrides: 按参数名覆盖rank，格式为"name=rank,name=rank"。
-          factor_stable_rank:
-                         True时使用已通信factor的norm稳定性做阶梯式降rank。
+          update_norm_stable_rank:
+                         True时使用同步后update norm的时间稳定性做阶梯式降rank。
         """
         super().__init__(random_seed, device, timer)
 
@@ -80,26 +82,25 @@ class HalfRankKReducer(Reducer):
         self.p_memory = {}          # {key: Tensor(n, max_rank)}
         self.q_memory = {}          # {key: Tensor(m, max_rank)}
         self.residuals = {}         # {key: Tensor(n, m)}  Error Feedback残差
-        self.last_input = {}        # {key: Tensor(n, m)}  保留调试信息
 
         # 记录每个key上次使用的rank，用于检测rank是否发生变化
         # 结构：{key: int}
         # compress写入，decompress读取，保证二者使用完全相同的active rank
         self.rank_memory = {}
         self.max_rank_memory = {}
-        self.residual_norms = {}
-        self.grad_norms = {}
-        self.factor_stable_rank = bool(factor_stable_rank)
+        self.update_norm_stable_rank = bool(update_norm_stable_rank)
         self.stable_rank_levels = self._build_stable_rank_levels(stable_rank_levels, rank)
-        self.stable_factor_tol = float(stable_factor_tol)
-        self.stable_factor_patience = max(1, int(stable_factor_patience))
-        self.stable_factor_smoothing = float(stable_factor_smoothing)
-        self.stable_factor_debug_every = max(0, int(stable_factor_debug_every))
-        self.global_factor_rank_level_idx = 0
-        self.pending_global_factor_rank_level = None
-        self.global_factor_norm_ema = {}
-        self.global_factor_norm_stable_count = {}
-        self._global_factor_observation = None
+        self.update_norm_stable_tol = float(update_norm_stable_tol)
+        self.update_norm_critical_tol = float(update_norm_critical_tol)
+        self.update_norm_patience = max(1, int(update_norm_patience))
+        self.update_norm_smoothing = float(update_norm_smoothing)
+        self.update_norm_debug_every = max(0, int(update_norm_debug_every))
+        self.global_rank_level_idx = 0
+        self.pending_global_rank_level = None
+        self.global_update_norm_ema = None
+        self.global_update_norm_last = None
+        self.global_update_norm_stable_count = 0
+        self._global_update_norm_observation = None
 
         self.name = 'halfrankk'
 
@@ -191,16 +192,16 @@ class HalfRankKReducer(Reducer):
             return applicable[max(applicable)]
         return self.default_rank
 
-    def _factor_stable_base_rank(self, step, n, m, name=None, shape=None):
+    def _stable_base_rank(self, step, n, m, name=None, shape=None):
         if name is not None and name.lower() in self.rank_overrides:
             return self.rank_overrides[name.lower()]
-        pending = self.pending_global_factor_rank_level
+        pending = self.pending_global_rank_level
         if pending is not None:
             pending_level_idx, apply_step = pending
             if step >= apply_step:
-                self.global_factor_rank_level_idx = pending_level_idx
-                self.pending_global_factor_rank_level = None
-        level_idx = self.global_factor_rank_level_idx
+                self.global_rank_level_idx = pending_level_idx
+                self.pending_global_rank_level = None
+        level_idx = self.global_rank_level_idx
         level_idx = max(0, min(level_idx, len(self.stable_rank_levels) - 1))
         return self.stable_rank_levels[level_idx]
 
@@ -218,8 +219,8 @@ class HalfRankKReducer(Reducer):
           step : 当前训练步数（外部传入，从dopt_rsag的step获取）
           n, m : 当前tensor reshape后的矩阵维度
         """
-        if self.factor_stable_rank:
-            base_rank = self._factor_stable_base_rank(step, n, m, name=name, shape=shape)
+        if self.update_norm_stable_rank:
+            base_rank = self._stable_base_rank(step, n, m, name=name, shape=shape)
         else:
             base_rank = self._scheduled_base_rank(step, name=name)
 
@@ -296,96 +297,106 @@ class HalfRankKReducer(Reducer):
             return self.default_rank
         return max(self.rank_schedule.values())
 
-    def begin_global_factor_observation(self, step, factor_kind, num_groups):
+    def wants_update_norm_observation(self):
+        return self.update_norm_stable_rank
+
+    def begin_global_update_norm_observation(self, step, num_groups):
         """
-        为当前step的已通信compressed buffers开启一次全局稳定性观测。
+        为当前step的同步后update norm开启一次全局稳定性观测。
+        dopt_rsag在每个all-gather group解压并除以worker数后追加该group的norm。
         """
-        if not self.factor_stable_rank:
+        if not self.update_norm_stable_rank:
             return
-        self._global_factor_observation = {
+        self._global_update_norm_observation = {
             'step': int(step),
-            'factor_kind': factor_kind,
             'num_groups': int(num_groups),
             'seen_groups': set(),
             'norm_sq_terms': [],
         }
 
-    def observe_global_factor_group(self, group_buffer, step, group_idx, factor_kind):
+    def observe_global_update_norm_group(self, norm_sq, step, group_idx):
         """
-        记录一个已经all-gather完成的compressed group buffer。
-        所有group收齐后，用全局buffer norm稳定性决定下一轮统一rank。
+        记录一个已经解压完成的同步update group的L2 norm平方。
+        所有group收齐后，用update norm的时间稳定性决定下一轮统一rank。
         """
-        if not self.factor_stable_rank or group_buffer is None:
+        if not self.update_norm_stable_rank or norm_sq is None:
             return
-        obs = self._global_factor_observation
+        obs = self._global_update_norm_observation
         if (
             obs is None
             or obs['step'] != int(step)
-            or obs['factor_kind'] != factor_kind
             or group_idx in obs['seen_groups']
         ):
             return
 
         obs['seen_groups'].add(group_idx)
-        obs['norm_sq_terms'].append(torch.sum(group_buffer.detach().float() ** 2))
+        obs['norm_sq_terms'].append(norm_sq.detach().float())
         if len(obs['seen_groups']) >= obs['num_groups']:
-            self._finish_global_factor_observation(obs)
+            self._finish_global_update_norm_observation(obs)
 
-    def _finish_global_factor_observation(self, obs):
+    def _finish_global_update_norm_observation(self, obs):
         if not obs['norm_sq_terms']:
             return
-        factor_kind = obs['factor_kind']
         norm_sq = torch.stack(obs['norm_sq_terms']).sum()
         norm_value = float(torch.sqrt(norm_sq).item())
-        old_ema = self.global_factor_norm_ema.get(factor_kind)
+
+        old_ema = self.global_update_norm_ema
+        old_norm = self.global_update_norm_last
         if old_ema is None:
-            self.global_factor_norm_ema[factor_kind] = norm_value
-            self._global_factor_observation = None
+            self.global_update_norm_ema = norm_value
+            self.global_update_norm_last = norm_value
+            self._global_update_norm_observation = None
             return
 
-        rel_change = abs(norm_value - old_ema) / (abs(old_ema) + 1e-12)
-        alpha = self.stable_factor_smoothing
-        self.global_factor_norm_ema[factor_kind] = alpha * old_ema + (1.0 - alpha) * norm_value
+        alpha = self.update_norm_smoothing
+        new_ema = alpha * old_ema + (1.0 - alpha) * norm_value
+        raw_change = abs(norm_value - old_norm) / (abs(old_norm) + 1e-12)
+        ema_change = abs(new_ema - old_ema) / (abs(old_ema) + 1e-12)
+        self.global_update_norm_ema = new_ema
+        self.global_update_norm_last = norm_value
 
-        if rel_change <= self.stable_factor_tol:
-            stable_count = self.global_factor_norm_stable_count.get(factor_kind, 0) + 1
+        if raw_change >= self.update_norm_critical_tol:
+            stable_count = 0
+        elif ema_change <= self.update_norm_stable_tol:
+            stable_count = self.global_update_norm_stable_count + 1
         else:
             stable_count = 0
-        self.global_factor_norm_stable_count[factor_kind] = stable_count
-        self._debug_global_factor_observation(
-            obs, factor_kind, norm_value, old_ema, rel_change, stable_count
+        self.global_update_norm_stable_count = stable_count
+
+        self._debug_global_update_norm_observation(
+            obs, norm_value, new_ema, raw_change, ema_change, stable_count
         )
 
-        level_idx = self.global_factor_rank_level_idx
-        if stable_count < self.stable_factor_patience or level_idx >= len(self.stable_rank_levels) - 1:
-            self._global_factor_observation = None
+        level_idx = self.global_rank_level_idx
+        if stable_count < self.update_norm_patience or level_idx >= len(self.stable_rank_levels) - 1:
+            self._global_update_norm_observation = None
             return
 
         old_rank = self.stable_rank_levels[level_idx]
         new_level_idx = level_idx + 1
         new_rank = self.stable_rank_levels[new_level_idx]
-
         apply_step = int(obs['step']) + 1
-        self.pending_global_factor_rank_level = (new_level_idx, apply_step)
-        self.global_factor_norm_stable_count = {}
-        self.global_factor_norm_ema = {}
-        self._global_factor_observation = None
+        self.pending_global_rank_level = (new_level_idx, apply_step)
+        self.global_update_norm_ema = None
+        self.global_update_norm_last = None
+        self.global_update_norm_stable_count = 0
+        self._global_update_norm_observation = None
         try:
             worker_rank = torch.distributed.get_rank()
         except Exception:
             worker_rank = 0
         if worker_rank == 0:
             print(
-                "[StableFactorRank] step=%s factor=%s global_rank=%s -> %s pending_from_step=%s stable_count=%s rel_change=%.6f"
-                % (obs['step'], factor_kind, old_rank, new_rank, apply_step, stable_count, rel_change),
+                "[StableUpdateNormRank] step=%s global_rank=%s -> %s pending_from_step=%s stable_count=%s raw_change=%.6f ema_change=%.6f"
+                % (obs['step'], old_rank, new_rank, apply_step, stable_count, raw_change, ema_change),
                 flush=True,
             )
 
-    def _debug_global_factor_observation(self, obs, factor_kind, norm_value, ema, rel_change, stable_count):
-        if self.stable_factor_debug_every <= 0:
+    def _debug_global_update_norm_observation(self, obs, norm_value, ema, raw_change, ema_change, stable_count):
+        if self.update_norm_debug_every <= 0:
             return
         step = int(obs['step'])
-        if step % self.stable_factor_debug_every != 0:
+        if step % self.update_norm_debug_every != 0:
             return
         try:
             worker_rank = torch.distributed.get_rank()
@@ -393,10 +404,10 @@ class HalfRankKReducer(Reducer):
             worker_rank = 0
         if worker_rank != 0:
             return
-        current_rank = self.stable_rank_levels[self.global_factor_rank_level_idx]
+        current_rank = self.stable_rank_levels[self.global_rank_level_idx]
         print(
-            "[StableFactorDebug] step=%s factor=%s norm_value=%.6e ema=%.6e rel_change=%.6f stable_count=%s current_rank=%s"
-            % (step, factor_kind, norm_value, ema, rel_change, stable_count, current_rank),
+            "[StableUpdateNormDebug] step=%s norm_value=%.6e ema=%.6e raw_change=%.6f ema_change=%.6f stable_count=%s current_rank=%s"
+            % (step, norm_value, ema, raw_change, ema_change, stable_count, current_rank),
             flush=True,
         )
 
@@ -504,7 +515,6 @@ class HalfRankKReducer(Reducer):
         # 这里保持 ACP-SGD 语义：残差在本地压缩阶段更新，而不是等通信后再更新。
         residual = self.residuals[key]
         matrix = grad_matrix + residual
-        self.last_input[key] = matrix.clone()
 
         # 初始化p/q母空间（首次按最大rank创建，rank变化时复用前缀列）
         if key not in self.p_memory:
