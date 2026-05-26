@@ -677,6 +677,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._grad_accs = []
         self._compression = compression  # 保存为实例属性（压缩新增）
         self._active_compression_factor = None
+        self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
         self._overlap_profiler = OverlapProfiler(
             enabled=os.environ.get('DEAR_OVERLAP_PROFILE', '0') == '1',
             summary_enabled=os.environ.get('DEAR_OVERLAP_SUMMARY', '0') == '1',
@@ -809,6 +810,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._module_group_flags = [0]*len(module_groups) # check whether module group is gathered
         self._param_group_flags = [[0]*len(g) for g in param_groups] # check whether param group is ready
         self._rs_group_handles = [None] * self._num_groups
+        self._ag_group_handles = [None] * self._num_groups
+        self._rs_launch_order = []
         self._compression_param_groups = param_groups
         self._param_by_name = {}
         topology_module_groups = [
@@ -1224,6 +1227,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         group_idx=group_idx,
                     )
                     self._rs_group_handles[group_idx] = handle
+                    self._rs_launch_order.append((group_idx, handle))
             else:
                 # 原有逻辑，push_to_buffer函数满了，才会返回pad_grad != None
                 new_name, pad_grad, shard_grad = self._push_to_buffer(name, tensor)
@@ -1238,6 +1242,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         group_idx=rs_group_idx,
                     )
                     self._rs_group_handles[rs_group_idx] = handle
+                    self._rs_launch_order.append((rs_group_idx, handle))
             return grad # 注意：hook 应该返回处理后的 grad
         return hook
     
@@ -1300,7 +1305,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 
                 # 等待上一组AG同步完成（Group0的AG是由step函数发起的）
                 ag_wait_start = time.perf_counter()
-                all_gather_comm.synchronize()
+                ag_handle = self._ag_group_handles[group_idx]
+                event_wait_issued = (
+                    self._event_sync_enabled
+                    and all_gather_comm.wait_event_on_current_stream(ag_handle)
+                )
+                if not event_wait_issued:
+                    all_gather_comm.synchronize()
                 self._overlap_profiler.note_ag_wait(
                     start_ts=ag_wait_start,
                     end_ts=time.perf_counter(),
@@ -1315,6 +1326,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 self._module_group_flags[group_idx] = 1  # done
                 if group_idx < self._num_groups - 1 and self._module_group_flags[group_idx+1] == 0:
                     self._allgather_one_group(group_idx+1)
+                elif self._event_sync_enabled and group_idx == self._num_groups - 1:
+                    all_gather_comm.clear_synchronized()
+                    self._ag_group_handles = [None] * self._num_groups
+                self._observe_active_compression_group(group_idx)
 
             # update params for this module
             self._update_one_module(module, name, group_idx)
@@ -1333,6 +1348,26 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     group_idx=group_idx,
                     module_name=name,
                 )
+
+    def _observe_active_compression_group(self, group_idx):
+        if self._active_compression_factor is None:
+            return
+        if not hasattr(self._compression, 'observe_global_factor_group'):
+            return
+        step = self._num_steps - 1
+        if step <= self._compression.warmup_steps:
+            return
+        self._prepare_active_compression_layout(step, self._active_compression_factor)
+        pad_buffers, _ = self._compression_buffers_for_factor(self._active_compression_factor)
+        group_sizes, _ = self._active_group_sizes_for_factor(self._active_compression_factor)
+        active_size = group_sizes[group_idx]
+        active_buffer = pad_buffers[group_idx][:active_size]
+        self._compression.observe_global_factor_group(
+            active_buffer,
+            step=step,
+            group_idx=group_idx,
+            factor_kind=self._active_compression_factor,
+        )
     
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
@@ -1531,7 +1566,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             pad_view, shard_view = self._compression_group_buffer_views_for_factor(
                 self._active_compression_factor, group_idx
             )
-            all_gather_comm.collective_async_(
+            handle = all_gather_comm.collective_async_(
                 "allGather-group-%d" % group_idx,
                 pad_view,
                 shard_view,
@@ -1541,13 +1576,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         else:
             pad_grad = self._pad_buffers[group_idx]
             shard_grad = self._shard_buffers[group_idx]
-            all_gather_comm.collective_async_(
+            handle = all_gather_comm.collective_async_(
                 "allGather-group-%d" % group_idx,
                 pad_grad,
                 shard_grad,
                 profiler=self._overlap_profiler,
                 group_idx=group_idx,
             )
+        self._ag_group_handles[group_idx] = handle
+        return handle
 
     """"    上面改为了压缩版
     def _allgather_one_group(self, group_idx):
@@ -1566,7 +1603,20 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # 计时（所有 reduce-scatter 通信 + 被 overlap 剩下的尾巴）  = RS_total_time − backward_overlap_time
         # 所有RS的同步操作
         rs_sync_start = time.perf_counter()
-        if self._overlap_profiler.enabled:
+        strict_profile_sync = (
+            self._overlap_profiler.enabled
+            and os.environ.get('DEAR_OVERLAP_NEEDS_SYNC', '0') == '1'
+        )
+        rs_ag_event_wait_issued = False
+        if self._event_sync_enabled and not strict_profile_sync and len(self._rs_launch_order) > 0:
+            _, last_rs_handle = self._rs_launch_order[-1]
+            rs_ag_event_wait_issued = all_gather_comm.wait_event_from(
+                reduce_scatter_comm, last_rs_handle
+            )
+            if rs_ag_event_wait_issued:
+                reduce_scatter_comm.clear_synchronized()
+
+        if not rs_ag_event_wait_issued and self._overlap_profiler.enabled:
             for group_idx, handle in enumerate(self._rs_group_handles):
                 if handle is None:
                     continue
@@ -1579,13 +1629,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     cuda_elapsed_ms=cuda_elapsed_ms,
                 )
             reduce_scatter_comm.clear_synchronized()
-        else:
+        elif not rs_ag_event_wait_issued:
             reduce_scatter_comm.synchronize()
         self._overlap_profiler.note_rs_sync(
             start_ts=rs_sync_start,
             end_ts=time.perf_counter(),
         )
         self._rs_group_handles = [None] * self._num_groups
+        self._rs_launch_order = []
         # print("Rank %d: Step %d, ReduceScatter time: %.10f sec" % (rank(), self._num_steps, rs_time))
 
         if self._compression and self._num_steps > self._compression.warmup_steps:
@@ -1593,10 +1644,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._prepare_active_compression_layout(
                 self._num_steps, self._active_compression_factor
             )
+            if hasattr(self._compression, 'begin_global_factor_observation'):
+                self._compression.begin_global_factor_observation(
+                    self._num_steps, self._active_compression_factor, self._num_groups
+                )
         else:
             self._active_compression_factor = None
         
         # 第一次调用AG 立即调用group0的AG通信
+        self._ag_group_handles = [None] * self._num_groups
         self._allgather_one_group(group_idx=0)
         #if rank() == 0:
             #print("param group flags:", self._param_group_flags)

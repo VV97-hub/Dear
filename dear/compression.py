@@ -42,7 +42,10 @@ class HalfRankKReducer(Reducer):
 
     def __init__(self, random_seed=0, device=None, timer=None, rank=2,
                  rank_schedule=None, warmup_steps=200,
-                 min_compression_numel=16384, rank_overrides=None):
+                 min_compression_numel=16384, rank_overrides=None,
+                 factor_stable_rank=False, stable_rank_levels=None,
+                 stable_factor_tol=0.02, stable_factor_patience=100,
+                 stable_factor_smoothing=0.95, stable_factor_debug_every=0):
         """
         参数说明：
           rank          : 默认/初始rank值，当rank_schedule未覆盖当前step时使用。
@@ -55,6 +58,8 @@ class HalfRankKReducer(Reducer):
                              完全自定义，可实现任意调度逻辑。
                           如果为 None，则始终使用 rank 参数（固定rank，兼容旧行为）。
           rank_overrides: 按参数名覆盖rank，格式为"name=rank,name=rank"。
+          factor_stable_rank:
+                         True时使用已通信factor的norm稳定性做阶梯式降rank。
         """
         super().__init__(random_seed, device, timer)
 
@@ -84,6 +89,17 @@ class HalfRankKReducer(Reducer):
         self.max_rank_memory = {}
         self.residual_norms = {}
         self.grad_norms = {}
+        self.factor_stable_rank = bool(factor_stable_rank)
+        self.stable_rank_levels = self._build_stable_rank_levels(stable_rank_levels, rank)
+        self.stable_factor_tol = float(stable_factor_tol)
+        self.stable_factor_patience = max(1, int(stable_factor_patience))
+        self.stable_factor_smoothing = float(stable_factor_smoothing)
+        self.stable_factor_debug_every = max(0, int(stable_factor_debug_every))
+        self.global_factor_rank_level_idx = 0
+        self.pending_global_factor_rank_level = None
+        self.global_factor_norm_ema = {}
+        self.global_factor_norm_stable_count = {}
+        self._global_factor_observation = None
 
         self.name = 'halfrankk'
 
@@ -102,6 +118,23 @@ class HalfRankKReducer(Reducer):
     def factor_kind_for_update(self, step):
         # dopt_rsag.step() 在 backward 之后自增 step，因此更新阶段需要回看上一轮发送的因子。
         return 'p' if step % 2 != 0 else 'q'
+
+    def _build_stable_rank_levels(self, levels, max_rank):
+        if levels is None or str(levels).strip() == '':
+            raw_levels = [max_rank, round(max_rank * 0.75), max_rank // 2]
+        elif isinstance(levels, str):
+            raw_levels = [int(x.strip()) for x in levels.split(',') if x.strip()]
+        else:
+            raw_levels = [int(x) for x in levels]
+
+        cleaned = []
+        for level in raw_levels:
+            level = max(1, min(int(max_rank), int(level)))
+            if level not in cleaned:
+                cleaned.append(level)
+        if not cleaned:
+            cleaned = [max(1, int(max_rank))]
+        return cleaned
 
     def _should_skip_by_name(self, name):
         if not name:
@@ -142,7 +175,36 @@ class HalfRankKReducer(Reducer):
     # ------------------------------------------------------------------
     # 工具方法：根据当前step计算本轮实际使用的rank
     # ------------------------------------------------------------------
-    def _get_rank(self, step, n, m, name=None):
+    def _scheduled_base_rank(self, step, name=None):
+        if name is not None and name.lower() in self.rank_overrides:
+            return self.rank_overrides[name.lower()]
+        if self.rank_schedule is None:
+            # 未配置调度器，使用固定rank（兼容旧接口）
+            return self.default_rank
+        if callable(self.rank_schedule):
+            # 函数式调度：完全由外部逻辑控制
+            return self.rank_schedule(step)
+
+        # dict调度：找到所有不超过当前step的阈值中最大的那个
+        applicable = {s: r for s, r in self.rank_schedule.items() if s <= step}
+        if applicable:
+            return applicable[max(applicable)]
+        return self.default_rank
+
+    def _factor_stable_base_rank(self, step, n, m, name=None, shape=None):
+        if name is not None and name.lower() in self.rank_overrides:
+            return self.rank_overrides[name.lower()]
+        pending = self.pending_global_factor_rank_level
+        if pending is not None:
+            pending_level_idx, apply_step = pending
+            if step >= apply_step:
+                self.global_factor_rank_level_idx = pending_level_idx
+                self.pending_global_factor_rank_level = None
+        level_idx = self.global_factor_rank_level_idx
+        level_idx = max(0, min(level_idx, len(self.stable_rank_levels) - 1))
+        return self.stable_rank_levels[level_idx]
+
+    def _get_rank(self, step, n, m, name=None, shape=None, device=None):
         """
         计算当前step应使用的rank值。
 
@@ -156,23 +218,10 @@ class HalfRankKReducer(Reducer):
           step : 当前训练步数（外部传入，从dopt_rsag的step获取）
           n, m : 当前tensor reshape后的矩阵维度
         """
-        if name is not None and name.lower() in self.rank_overrides:
-            base_rank = self.rank_overrides[name.lower()]
-        elif self.rank_schedule is None:
-            # 未配置调度器，使用固定rank（兼容旧接口）
-            base_rank = self.default_rank
-        elif callable(self.rank_schedule):
-            # 函数式调度：完全由外部逻辑控制
-            base_rank = self.rank_schedule(step)
+        if self.factor_stable_rank:
+            base_rank = self._factor_stable_base_rank(step, n, m, name=name, shape=shape)
         else:
-            # dict调度：找到所有不超过当前step的阈值中最大的那个
-            # 例如 schedule={0:4, 1000:2, 5000:1}，step=1500 → 取阈值1000 → rank=2
-            applicable = {s: r for s, r in self.rank_schedule.items() if s <= step}
-            if applicable:
-                base_rank = applicable[max(applicable)]
-            else:
-                # step比所有阈值都小时，退回default_rank
-                base_rank = self.default_rank
+            base_rank = self._scheduled_base_rank(step, name=name)
 
         # TODO 未来可在这里加入按 tensor 大小动态调整 rank 的逻辑
         """ 
@@ -186,7 +235,8 @@ class HalfRankKReducer(Reducer):
         """
 
         max_allowed_rank = self.max_rank_for(name)
-        return max(1, min(n, m, max_allowed_rank, base_rank))
+        upper_rank = max(1, min(n, m, max_allowed_rank))
+        return min(upper_rank, max(1, min(upper_rank, base_rank)))
         
 
     # ------------------------------------------------------------------
@@ -246,6 +296,110 @@ class HalfRankKReducer(Reducer):
             return self.default_rank
         return max(self.rank_schedule.values())
 
+    def begin_global_factor_observation(self, step, factor_kind, num_groups):
+        """
+        为当前step的已通信compressed buffers开启一次全局稳定性观测。
+        """
+        if not self.factor_stable_rank:
+            return
+        self._global_factor_observation = {
+            'step': int(step),
+            'factor_kind': factor_kind,
+            'num_groups': int(num_groups),
+            'seen_groups': set(),
+            'norm_sq_terms': [],
+        }
+
+    def observe_global_factor_group(self, group_buffer, step, group_idx, factor_kind):
+        """
+        记录一个已经all-gather完成的compressed group buffer。
+        所有group收齐后，用全局buffer norm稳定性决定下一轮统一rank。
+        """
+        if not self.factor_stable_rank or group_buffer is None:
+            return
+        obs = self._global_factor_observation
+        if (
+            obs is None
+            or obs['step'] != int(step)
+            or obs['factor_kind'] != factor_kind
+            or group_idx in obs['seen_groups']
+        ):
+            return
+
+        obs['seen_groups'].add(group_idx)
+        obs['norm_sq_terms'].append(torch.sum(group_buffer.detach().float() ** 2))
+        if len(obs['seen_groups']) >= obs['num_groups']:
+            self._finish_global_factor_observation(obs)
+
+    def _finish_global_factor_observation(self, obs):
+        if not obs['norm_sq_terms']:
+            return
+        factor_kind = obs['factor_kind']
+        norm_sq = torch.stack(obs['norm_sq_terms']).sum()
+        norm_value = float(torch.sqrt(norm_sq).item())
+        old_ema = self.global_factor_norm_ema.get(factor_kind)
+        if old_ema is None:
+            self.global_factor_norm_ema[factor_kind] = norm_value
+            self._global_factor_observation = None
+            return
+
+        rel_change = abs(norm_value - old_ema) / (abs(old_ema) + 1e-12)
+        alpha = self.stable_factor_smoothing
+        self.global_factor_norm_ema[factor_kind] = alpha * old_ema + (1.0 - alpha) * norm_value
+
+        if rel_change <= self.stable_factor_tol:
+            stable_count = self.global_factor_norm_stable_count.get(factor_kind, 0) + 1
+        else:
+            stable_count = 0
+        self.global_factor_norm_stable_count[factor_kind] = stable_count
+        self._debug_global_factor_observation(
+            obs, factor_kind, norm_value, old_ema, rel_change, stable_count
+        )
+
+        level_idx = self.global_factor_rank_level_idx
+        if stable_count < self.stable_factor_patience or level_idx >= len(self.stable_rank_levels) - 1:
+            self._global_factor_observation = None
+            return
+
+        old_rank = self.stable_rank_levels[level_idx]
+        new_level_idx = level_idx + 1
+        new_rank = self.stable_rank_levels[new_level_idx]
+
+        apply_step = int(obs['step']) + 1
+        self.pending_global_factor_rank_level = (new_level_idx, apply_step)
+        self.global_factor_norm_stable_count = {}
+        self.global_factor_norm_ema = {}
+        self._global_factor_observation = None
+        try:
+            worker_rank = torch.distributed.get_rank()
+        except Exception:
+            worker_rank = 0
+        if worker_rank == 0:
+            print(
+                "[StableFactorRank] step=%s factor=%s global_rank=%s -> %s pending_from_step=%s stable_count=%s rel_change=%.6f"
+                % (obs['step'], factor_kind, old_rank, new_rank, apply_step, stable_count, rel_change),
+                flush=True,
+            )
+
+    def _debug_global_factor_observation(self, obs, factor_kind, norm_value, ema, rel_change, stable_count):
+        if self.stable_factor_debug_every <= 0:
+            return
+        step = int(obs['step'])
+        if step % self.stable_factor_debug_every != 0:
+            return
+        try:
+            worker_rank = torch.distributed.get_rank()
+        except Exception:
+            worker_rank = 0
+        if worker_rank != 0:
+            return
+        current_rank = self.stable_rank_levels[self.global_factor_rank_level_idx]
+        print(
+            "[StableFactorDebug] step=%s factor=%s norm_value=%.6e ema=%.6e rel_change=%.6f stable_count=%s current_rank=%s"
+            % (step, factor_kind, norm_value, ema, rel_change, stable_count, current_rank),
+            flush=True,
+        )
+
     def get_rank_for_step(self, name, shape, step):
         if not self.should_compress_shape(shape, name=name):
             return None
@@ -253,7 +407,7 @@ class HalfRankKReducer(Reducer):
         m = 1
         for dim in shape[1:]:
             m *= int(dim)
-        return self._get_rank(step, n, m, name=name)
+        return self._get_rank(step, n, m, name=name, shape=shape, device=self.device)
 
     def get_rank_for(self, name, shape):
         """
@@ -330,7 +484,9 @@ class HalfRankKReducer(Reducer):
         n, m = grad_matrix.shape
 
         # ---- 动态rank核心：计算本轮rank并按需重建内存 ----
-        rank = self._get_rank(step, n, m, name=name)
+        rank = self._get_rank(
+            step, n, m, name=name, shape=tensor.shape, device=tensor.device
+        )
         max_rank = max(1, min(n, m, self.max_rank_for(name)))
         # key同时包含shape，防止同name不同shape的tensor复用同一内存
         key = (name, tuple(tensor.shape))

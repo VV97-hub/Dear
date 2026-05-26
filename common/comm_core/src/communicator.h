@@ -76,6 +76,9 @@ public:
     void syncStream(int handler);
     void syncEvent(int handler);
     float syncEventElapsedFromBase(int handler);
+    void waitCurrentStream();
+    void waitEvent(Communicator &producer, int handler);
+    void waitEventOnCurrentStream(int handler);
     void clearEvents();
 
     int getNumOfFreeStreams();

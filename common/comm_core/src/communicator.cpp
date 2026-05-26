@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "communicator.h"
 
 /* 无用
@@ -189,6 +190,31 @@ float Communicator::syncEventElapsedFromBase(int handler) {
         m_op_events[handler] = nullptr;
     }
     return elapsed_ms;
+}
+
+void Communicator::waitCurrentStream() {
+    int current_comm = m_current_comm;
+    cudaStream_t current_stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaEvent_t event;
+    CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDACHECK(cudaEventRecord(event, current_stream));
+    CUDACHECK(cudaStreamWaitEvent(m_streams[current_comm], event, 0));
+    CUDACHECK(cudaEventDestroy(event));
+}
+
+void Communicator::waitEvent(Communicator &producer, int handler) {
+    int current_comm = m_current_comm;
+    if (handler >= 0 && handler < static_cast<int>(producer.m_op_events.size())
+            && producer.m_op_events[handler] != nullptr) {
+        CUDACHECK(cudaStreamWaitEvent(m_streams[current_comm], producer.m_op_events[handler], 0));
+    }
+}
+
+void Communicator::waitEventOnCurrentStream(int handler) {
+    if (handler >= 0 && handler < static_cast<int>(m_op_events.size()) && m_op_events[handler] != nullptr) {
+        cudaStream_t current_stream = at::cuda::getCurrentCUDAStream().stream();
+        CUDACHECK(cudaStreamWaitEvent(current_stream, m_op_events[handler], 0));
+    }
 }
 
 void Communicator::clearEvents() {

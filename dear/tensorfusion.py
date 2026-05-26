@@ -2,6 +2,7 @@ import torch
 import numpy as np
 #from acomm import rank, size, Communicator
 from comm_core import rank, size, Communicator
+import os
 import time
 
 
@@ -465,6 +466,7 @@ class CommReduceScatter:
         self.merged_comm = Communicator(nstreams)
         self._current_stream = torch.cuda.current_stream()
         self.op = op
+        self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
 
         self._name_tensors = {}
         self.handles = []
@@ -475,10 +477,12 @@ class CommReduceScatter:
 
     def collective_async_(self, name, pad_tensor, shard_tensor, profiler=None, group_idx=None):
         self._name_tensors[name] = (pad_tensor, shard_tensor)
-        # Validation barrier: ensure the compute stream has finished writing the
-        # fusion buffers before NCCL starts reading them on the comm stream.
-        current_stream = torch.cuda.current_stream(device=pad_tensor.device)
-        current_stream.synchronize()
+        if self._event_sync_enabled and hasattr(self.merged_comm, 'waitCurrentStream'):
+            if self.op == CollectiveOp.REDUCE_SCATTER:
+                self.merged_comm.waitCurrentStream()
+        else:
+            current_stream = torch.cuda.current_stream(device=pad_tensor.device)
+            current_stream.synchronize()
 
         if self.op == CollectiveOp.REDUCE_SCATTER:
             if profiler is not None:
@@ -509,6 +513,22 @@ class CommReduceScatter:
     def synchronize_name(self, name):
         return self.synchronize_handle(self._handles_by_name.get(name))
 
+    def wait_event_from(self, producer_comm, handle):
+        if handle is None:
+            return False
+        if hasattr(self.merged_comm, 'waitEvent'):
+            self.merged_comm.waitEvent(producer_comm.merged_comm, handle)
+            return True
+        return False
+
+    def wait_event_on_current_stream(self, handle):
+        if handle is None:
+            return False
+        if hasattr(self.merged_comm, 'waitEventOnCurrentStream'):
+            self.merged_comm.waitEventOnCurrentStream(handle)
+            return True
+        return False
+
     def clear_synchronized(self):
         if hasattr(self.merged_comm, 'clearEvents'):
             self.merged_comm.clearEvents()
@@ -518,7 +538,8 @@ class CommReduceScatter:
 
     def synchronize(self):
         self.merged_comm.synchronize()
-        torch.cuda.synchronize()   # ✅ 全局等待所有 GPU 操作完成
+        if not self._event_sync_enabled:
+            torch.cuda.synchronize()   # ✅ 全局等待所有 GPU 操作完成
         # torch.cuda.current_stream().wait_stream(self.merged_comm._current_stream)
         self._name_tensors.clear()
         self.handles.clear()

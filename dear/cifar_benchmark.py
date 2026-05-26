@@ -72,7 +72,12 @@ parser.add_argument("--overlap-console", type=int, default=1)
 parser.add_argument("--compress-rank", type=int, default=8)
 parser.add_argument("--compress-warmup", type=int, default=1000)
 parser.add_argument("--compress-min-numel", type=int, default=16384)
-parser.add_argument("--rank-schedule", type=str, default=None, choices=[None, "aggressive", "gentle"])
+parser.add_argument("--rank-schedule", type=str, default=None, choices=[None, "aggressive", "gentle", "factor_stable"])
+parser.add_argument("--stable-rank-levels", type=str, default="")
+parser.add_argument("--stable-factor-tol", type=float, default=0.02)
+parser.add_argument("--stable-factor-patience", type=int, default=100)
+parser.add_argument("--stable-factor-smoothing", type=float, default=0.95)
+parser.add_argument("--stable-factor-debug-every", type=int, default=0)
 args = parser.parse_args()
 args.lr_decay_epochs = [int(epoch) for epoch in args.lr_decay_epochs.split(",") if epoch]
 args.dataset = "cifar100" if args.model.startswith("cifar100_") else "cifar10"
@@ -112,6 +117,7 @@ if args.cuda:
 
 RANK_SCHEDULES = {
     None: None,
+    "factor_stable": None,
     "aggressive": {
         0: args.compress_rank,
         args.compress_warmup + 6000: max(1, args.compress_rank // 2),
@@ -145,6 +151,12 @@ print(f"compress_rank: {args.compress_rank}")
 print(f"compress_warmup: {args.compress_warmup}")
 print(f"compress_min_numel: {args.compress_min_numel}")
 print(f"rank_schedule: {args.rank_schedule}")
+if args.rank_schedule == "factor_stable":
+    print(f"stable_rank_levels: {args.stable_rank_levels or 'auto'}")
+    print(f"stable_factor_tol: {args.stable_factor_tol}")
+    print(f"stable_factor_patience: {args.stable_factor_patience}")
+    print(f"stable_factor_smoothing: {args.stable_factor_smoothing}")
+    print(f"stable_factor_debug_every: {args.stable_factor_debug_every}")
 print("========================================")
 
 def hvd_barrier():
@@ -275,6 +287,12 @@ if hvd.size() > 1:
             rank_schedule=RANK_SCHEDULES[args.rank_schedule],
             warmup_steps=args.compress_warmup,
             min_compression_numel=args.compress_min_numel,
+            factor_stable_rank=args.rank_schedule == "factor_stable",
+            stable_rank_levels=args.stable_rank_levels,
+            stable_factor_tol=args.stable_factor_tol,
+            stable_factor_patience=args.stable_factor_patience,
+            stable_factor_smoothing=args.stable_factor_smoothing,
+            stable_factor_debug_every=args.stable_factor_debug_every,
         ),
         is_sparse=args.density < 1,
         density=args.density,
