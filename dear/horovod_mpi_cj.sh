@@ -13,6 +13,15 @@ fi
 download_dataset="${download_dataset:-0}"
 # compressor的选项none、halfrankk、(topk、eftopk，gaussian，signum，efsignum，)
 compressor="${compressor:-halfrankk}"
+compress_rank="${compress_rank:-}"
+compress_warmup="${compress_warmup:-}"
+compress_refresh_k="${compress_refresh_k:-}"
+compress_min_numel="${compress_min_numel:-}"
+rank_schedule="${rank_schedule:-}"
+stable_rank_levels="${stable_rank_levels:-}"
+rank_reset_on_change="${rank_reset_on_change:-0}"
+active_prefix_enabled="${active_prefix_enabled:-1}"
+embedding_policy="${embedding_policy:-word}"
 senlen="${senlen:-64}"
 rdma="${rdma:-0}"
 nstreams="${nstreams:-1}"
@@ -124,16 +133,45 @@ append_overlap_args() {
     echo "$current"
 }
 
+append_acpr_args() {
+    local current="$1"
+    if [ -n "$compress_rank" ]; then
+        current="$current --compress-rank $compress_rank"
+    fi
+    if [ -n "$compress_warmup" ]; then
+        current="$current --compress-warmup $compress_warmup"
+    fi
+    if [ -n "$compress_refresh_k" ]; then
+        current="$current --compress-refresh-k $compress_refresh_k"
+    fi
+    if [ -n "$compress_min_numel" ]; then
+        current="$current --compress-min-numel $compress_min_numel"
+    fi
+    if [ -n "$rank_schedule" ]; then
+        current="$current --rank-schedule $rank_schedule"
+    fi
+    if [ -n "$stable_rank_levels" ]; then
+        current="$current --stable-rank-levels $stable_rank_levels"
+    fi
+    if [ "$rank_reset_on_change" = "1" ]; then
+        current="$current --rank-reset-on-change"
+    fi
+    current="$current --active-prefix-enabled $active_prefix_enabled --embedding-policy $embedding_policy"
+    echo "$current"
+}
+
 # 前面层层包装起来，cmd{benchfile{选模型}}
 if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
     benchfile=$(append_overlap_args "$benchfile")
+    benchfile=$(append_acpr_args "$benchfile")
 elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn" = "cifar100_resnet18" ] || [ "$dnn" = "cifar100_vgg16" ]; then
     benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts --data-dir $data_dir"
     if [ "$download_dataset" = "1" ]; then
         benchfile="$benchfile --download-dataset"
     fi
     benchfile=$(append_overlap_args "$benchfile")
+    benchfile=$(append_acpr_args "$benchfile")
 else
     benchfile="imagenet_benchmark.py --model $dnn --exclude-parts $exclude_parts"
 fi

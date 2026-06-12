@@ -673,7 +673,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             threshold=THRESHOLD, 
             exclude_parts='',
             compression=None,
-            refresh_k=0):  # 添加 compression 参数（压缩新增）
+            refresh_k=0,
+            active_prefix_enabled=True):  # 添加 compression 参数（压缩新增）
         r"""Distributed optimizer with overlapping reduceScatter and allGather and tensor fusion.
 
         Args:
@@ -691,6 +692,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._refresh_k = int(refresh_k or 0)
         if self._refresh_k > 0:
             init_refresh_comms()
+        self._active_prefix_enabled = bool(active_prefix_enabled)
         self._active_compression_factor = None
         self._step_update_done = False
         self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
@@ -954,6 +956,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     'compressed_q_buffer_bytes': int(self._compressed_pad_buffers_q[group_idx].numel() * 4),
                     'compressed_q_buffer_mb': float(self._compressed_pad_buffers_q[group_idx].numel() * 4 / 1024 / 1024),
                 })
+            self._compressed_group_sizes_p = compressed_group_sizes_p
+            self._compressed_group_sizes_q = compressed_group_sizes_q
             self._active_compression_layout_step = None
             self._active_compression_layout_factor = None
             self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
@@ -1016,6 +1020,20 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
     def _prepare_active_compression_layout(self, step, factor_kind):
         if not self._compression:
+            return
+        if not self._active_prefix_enabled:
+            self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
+            self._active_compressed_param_offsets_q = self._compressed_param_offsets_q
+            self._active_compressed_group_sizes_p = self._compressed_group_sizes_p
+            self._active_compressed_group_sizes_q = self._compressed_group_sizes_q
+            self._active_compressed_padded_group_sizes_p = [
+                buf.numel() for buf in self._compressed_pad_buffers_p
+            ]
+            self._active_compressed_padded_group_sizes_q = [
+                buf.numel() for buf in self._compressed_pad_buffers_q
+            ]
+            self._active_compression_layout_step = step
+            self._active_compression_layout_factor = factor_kind
             return
         if (
             self._active_compression_layout_step == step
@@ -1958,7 +1976,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         #print("test tensor after:", test_tensor)
 
 # 将任意 PyTorch Optimizer 动态包装成 DeAR 分布式优化器
-def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, fp16=False, mgwfbp=False, rdma=False, multi_job_scheduling=False, exclude_parts='', refresh_k=0):
+def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, fp16=False, mgwfbp=False, rdma=False, multi_job_scheduling=False, exclude_parts='', refresh_k=0, active_prefix_enabled=True):
     """
     Wrap optimizer to gurantee the consistency. 
     Warning: some functions are not supported now, so we will simply skip these parameters.
@@ -1975,7 +1993,7 @@ def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, de
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
 
-    return cls(optimizer.param_groups, model, exclude_parts=exclude_parts,compression=compression, refresh_k=refresh_k) # 原本compression参数是没有要的（压缩新增）
+    return cls(optimizer.param_groups, model, exclude_parts=exclude_parts, compression=compression, refresh_k=refresh_k, active_prefix_enabled=active_prefix_enabled) # 原本compression参数是没有要的（压缩新增）
 
 def broadcast_parameters(params, root_rank):
     """

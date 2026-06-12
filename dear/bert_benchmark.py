@@ -96,10 +96,17 @@ parser.add_argument('--compress-rank', type=int, default=16)
 parser.add_argument('--compress-rank-overrides', type=str, default='',
                     help='comma-separated parameter-specific rank overrides, e.g. name=32,other=16')
 parser.add_argument('--compress-warmup', type=int, default=5000)
-parser.add_argument('--compress-refresh-k', type=int, default=1, # 默认 0，表示不开启刷新。
+parser.add_argument('--compress-refresh-k', type=int, default=0,
                     help='every K compressed steps run a two-AllReduce P/Q refresh; 0 disables')
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
+parser.add_argument('--rank-reset-on-change', action='store_true', default=False,
+                    help='reset P/Q/residual memory when the dynamic rank changes')
+parser.add_argument('--active-prefix-enabled', type=int, default=1, choices=[0, 1],
+                    help='use active prefix communication buffers for the current rank: 1 enables, 0 uses max-rank buffers')
+parser.add_argument('--embedding-policy', type=str, default='word',
+                    choices=['off', 'word', 'broad'],
+                    help='embedding compression policy: off skips all embeddings, word compresses word embedding/decoder, broad applies generic rules')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
 parser.add_argument('--rank-schedule', type=str, default='update_norm_stable',
                     choices=[None, 'aggressive', 'gentle','cosine','warmup_decay', 'update_norm_stable'])
@@ -505,9 +512,11 @@ if hvd.size() > 1:
     update_norm_critical_tol=args.update_norm_critical_tol,
     update_norm_patience=args.update_norm_patience,
     update_norm_smoothing=args.update_norm_smoothing,
-    update_norm_debug_every=args.update_norm_debug_every,), 
+    update_norm_debug_every=args.update_norm_debug_every,
+    rank_reset_on_change=args.rank_reset_on_change,
+    embedding_policy=args.embedding_policy,),
 
-    is_sparse=args.density<1, density=args.density, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=1, threshold=args.threshold, writer=None, gradient_path='./', fp16=args.fp16, mgwfbp=args.mgwfbp, rdma=args.rdma, exclude_parts=args.exclude_parts, refresh_k=args.compress_refresh_k)
+    is_sparse=args.density<1, density=args.density, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=1, threshold=args.threshold, writer=None, gradient_path='./', fp16=args.fp16, mgwfbp=args.mgwfbp, rdma=args.rdma, exclude_parts=args.exclude_parts, refresh_k=args.compress_refresh_k, active_prefix_enabled=bool(args.active_prefix_enabled))
     
     # Horovod: broadcast parameters & optimizer state.
     hvd.broadcast_parameters(model.state_dict(), root_rank=0)

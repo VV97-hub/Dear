@@ -72,6 +72,9 @@ parser.add_argument("--overlap-console", type=int, default=1)
 parser.add_argument("--compress-rank", type=int, default=8)
 parser.add_argument("--compress-warmup", type=int, default=1000)
 parser.add_argument("--compress-min-numel", type=int, default=16384)
+parser.add_argument("--rank-reset-on-change", action="store_true", default=False)
+parser.add_argument("--active-prefix-enabled", type=int, default=1, choices=[0, 1])
+parser.add_argument("--embedding-policy", type=str, default="word", choices=["off", "word", "broad"])
 parser.add_argument("--rank-schedule", type=str, default=None, choices=[None, "aggressive", "gentle", "update_norm_stable"])
 parser.add_argument("--stable-rank-levels", type=str, default="")
 parser.add_argument("--update-norm-stable-tol", type=float, default=0.01)
@@ -296,6 +299,8 @@ if hvd.size() > 1:
             update_norm_patience=args.update_norm_patience,
             update_norm_smoothing=args.update_norm_smoothing,
             update_norm_debug_every=args.update_norm_debug_every,
+            rank_reset_on_change=args.rank_reset_on_change,
+            embedding_policy=args.embedding_policy,
         ),
         is_sparse=args.density < 1,
         density=args.density,
@@ -309,6 +314,7 @@ if hvd.size() > 1:
         mgwfbp=args.mgwfbp,
         rdma=args.rdma,
         exclude_parts=args.exclude_parts,
+        active_prefix_enabled=bool(args.active_prefix_enabled),
     )
     hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 

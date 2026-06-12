@@ -48,7 +48,9 @@ class HalfRankKReducer(Reducer):
                  stable_rank_levels=None,
                  update_norm_stable_tol=0.01, update_norm_critical_tol=0.3,
                  update_norm_patience=100, update_norm_smoothing=0.9,
-                 update_norm_debug_every=0):
+                 update_norm_debug_every=0,
+                 rank_reset_on_change=False,
+                 embedding_policy='word'):
         """
         参数说明：
           rank          : 默认/初始rank值，当rank_schedule未覆盖当前step时使用。
@@ -63,6 +65,11 @@ class HalfRankKReducer(Reducer):
           rank_overrides: 按参数名覆盖rank，格式为"name=rank,name=rank"。
           update_norm_stable_rank:
                          True时使用同步后update norm的时间稳定性做阶梯式降rank。
+          rank_reset_on_change:
+                         True时rank变化后重建该tensor的P/Q/residual；False保留nested subspace。
+          embedding_policy:
+                         off跳过所有embedding相关参数；word只压缩word embedding/decoder；
+                         broad允许embedding参数按通用规则参与压缩。
         """
         super().__init__(random_seed, device, timer)
 
@@ -104,6 +111,15 @@ class HalfRankKReducer(Reducer):
         self._global_update_norm_observation = None
         self._debug_print_pq_shapes = os.environ.get('DEAR_PRINT_PQ_SHAPES', '0') == '1' # 输出P和Q的维度大小
         self._debug_printed_pq_shapes = set()
+        self.rank_reset_on_change = bool(rank_reset_on_change)
+        self.embedding_policy = str(
+            os.environ.get('DEAR_EMBEDDING_POLICY', embedding_policy)
+        ).strip().lower()
+        if self.embedding_policy not in ('off', 'word', 'broad'):
+            raise ValueError(
+                "embedding_policy must be one of: off, word, broad; got %r"
+                % self.embedding_policy
+            )
 
         self.name = 'halfrankk'
 
@@ -147,16 +163,19 @@ class HalfRankKReducer(Reducer):
         if lower_name.endswith("bias") or ".bias" in lower_name:
             return True
         if "embedding" in lower_name or "embeddings" in lower_name:
-            # 让embedding部分参与压缩：
-            allowed_embedding_names = {
-                "bert.embeddings.word_embeddings.weight",
-                "cls.predictions.decoder.weight",
-            }
-            if lower_name not in allowed_embedding_names:
+            if self.embedding_policy == 'off':
                 return True
-
-            # 不让embedding部分参与压缩：
-            # return True
+            if self.embedding_policy == 'word':
+                allowed_embedding_names = {
+                    "bert.embeddings.word_embeddings.weight",
+                    "cls.predictions.decoder.weight",
+                }
+                return lower_name not in allowed_embedding_names
+        if (
+            self.embedding_policy == 'off'
+            and lower_name == "cls.predictions.decoder.weight"
+        ):
+            return True
         if "layernorm" in lower_name or "layer_norm" in lower_name:
             return True
         return False
@@ -263,6 +282,16 @@ class HalfRankKReducer(Reducer):
                 % (step, label, old_rank, new_rank),
                 flush=True,
             )
+        if (
+            self.rank_reset_on_change
+            and old_rank is not None
+            and old_rank != new_rank
+        ):
+            self.p_memory.pop(key, None)
+            self.q_memory.pop(key, None)
+            self.residuals.pop(key, None)
+            self.max_rank_memory.pop(key, None)
+
         # 记录本轮rank，供decompress同步读取
         self.rank_memory[key] = new_rank
 
