@@ -91,6 +91,10 @@ parser.add_argument('--overlap-timeline-output', type=str, default='',
                     help='optional file path for detailed overlap timeline jsonl records')
 parser.add_argument('--overlap-console', type=int, default=1,
                     help='whether to print overlap summary to console: 1 or 0')
+parser.add_argument('--loss-log-every', type=int, default=0,
+                    help='print and record training loss every N steps; 0 disables loss.item() logging')
+parser.add_argument('--convergence-output', type=str, default='',
+                    help='optional rank-0 CSV path for step, elapsed time, loss, lr, and samples')
 # 动态rank增加：
 parser.add_argument('--compress-rank', type=int, default=16)
 parser.add_argument('--compress-rank-overrides', type=str, default='',
@@ -109,7 +113,7 @@ parser.add_argument('--embedding-policy', type=str, default='word',
                     help='embedding compression policy: off skips all embeddings, word compresses word embedding/decoder, broad applies generic rules')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
 parser.add_argument('--rank-schedule', type=str, default='update_norm_stable',
-                    choices=[None, 'aggressive', 'gentle','cosine','warmup_decay', 'update_norm_stable'])
+                    choices=['fixed', 'aggressive', 'gentle', 'cosine', 'warmup_decay', 'update_norm_stable'])
 parser.add_argument('--stable-rank-levels', type=str, default='16,12,8',
                     help='comma-separated rank levels for stable dynamic-rank schedules, default derives rank,0.75rank,0.5rank')
 parser.add_argument('--update-norm-stable-tol', type=float, default=0.05,
@@ -143,10 +147,16 @@ os.environ['DEAR_OVERLAP_WARMUP'] = str(args.overlap_warmup)
 os.environ['DEAR_OVERLAP_OUTPUT'] = args.overlap_output
 os.environ['DEAR_OVERLAP_TIMELINE_OUTPUT'] = args.overlap_timeline_output
 os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
+if args.convergence_output and hvd.rank() == 0:
+    convergence_dir = os.path.dirname(args.convergence_output)
+    if convergence_dir:
+        os.makedirs(convergence_dir, exist_ok=True)
+    with open(args.convergence_output, 'w') as f:
+        f.write('step,elapsed_time_s,loss,lr,samples_seen\n')
 
 # rank动态变化预设方案映射
 RANK_SCHEDULES = {
-    None:        None,
+    'fixed':    None,
     'update_norm_stable': None,
     'aggressive': {
         0: args.compress_rank,
@@ -574,6 +584,34 @@ def _adjust_lr(step):
     # 暂时停用压缩阶段的 lr / optimizer state 调整，先单独观察压缩算法本身。
     return
 
+
+run_start_time = time.perf_counter()
+
+
+def _current_lr():
+    if len(optimizer.param_groups) == 0:
+        return 0.0
+    return float(optimizer.param_groups[0].get('lr', 0.0))
+
+
+def _record_convergence(step, loss_value):
+    if hvd.rank() != 0:
+        return
+    elapsed_time_s = time.perf_counter() - run_start_time
+    samples_seen = int((step + 1) * args.batch_size * hvd.size())
+    lr = _current_lr()
+    print(
+        "CONVERGENCE step=%d elapsed_time_s=%.6f loss=%.6f lr=%.8g samples_seen=%d"
+        % (step, elapsed_time_s, loss_value, lr, samples_seen),
+        flush=True,
+    )
+    if args.convergence_output:
+        with open(args.convergence_output, 'a') as f:
+            f.write(
+                '%d,%.9f,%.9f,%.12g,%d\n'
+                % (step, elapsed_time_s, loss_value, lr, samples_seen)
+            )
+
         
             
 def benchmark_step():
@@ -618,9 +656,9 @@ def benchmark_step():
     if overlap_enabled and hasattr(optimizer, 'profile_forward_done'):
         optimizer.profile_forward_done()
 
-    if hvd.rank() == 0 and step % 5 == 0:
-        print("step:",step)
-        print(f"Loss: {loss.item():.4f}")
+    if args.loss_log_every > 0 and step % args.loss_log_every == 0:
+        loss_value = float(loss.detach().item())
+        _record_convergence(step, loss_value)
 
     if overlap_enabled and hasattr(optimizer, 'profile_backward_start'):
         optimizer.profile_backward_start()

@@ -3,6 +3,7 @@ from __future__ import print_function
 import argparse
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -48,6 +49,8 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--data-dir", type=str, default=None)
 parser.add_argument("--download-dataset", action="store_true", default=False)
 parser.add_argument("--print-freq", type=int, default=50)
+parser.add_argument("--convergence-log-every", type=int, default=0)
+parser.add_argument("--convergence-output", type=str, default="")
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--no-cuda", action="store_true", default=False)
 parser.add_argument("--use-adasum", action="store_true", default=False)
@@ -75,7 +78,7 @@ parser.add_argument("--compress-min-numel", type=int, default=16384)
 parser.add_argument("--rank-reset-on-change", action="store_true", default=False)
 parser.add_argument("--active-prefix-enabled", type=int, default=1, choices=[0, 1])
 parser.add_argument("--embedding-policy", type=str, default="word", choices=["off", "word", "broad"])
-parser.add_argument("--rank-schedule", type=str, default=None, choices=[None, "aggressive", "gentle", "update_norm_stable"])
+parser.add_argument("--rank-schedule", type=str, default="fixed", choices=["fixed", "aggressive", "gentle", "update_norm_stable"])
 parser.add_argument("--stable-rank-levels", type=str, default="")
 parser.add_argument("--update-norm-stable-tol", type=float, default=0.01)
 parser.add_argument("--update-norm-critical-tol", type=float, default=0.3)
@@ -106,6 +109,12 @@ os.environ["DEAR_OVERLAP_WARMUP"] = str(args.overlap_warmup)
 os.environ["DEAR_OVERLAP_OUTPUT"] = args.overlap_output
 os.environ["DEAR_OVERLAP_TIMELINE_OUTPUT"] = args.overlap_timeline_output
 os.environ["DEAR_OVERLAP_CONSOLE"] = str(args.overlap_console)
+if args.convergence_output and hvd.rank() == 0:
+    convergence_dir = os.path.dirname(args.convergence_output)
+    if convergence_dir:
+        os.makedirs(convergence_dir, exist_ok=True)
+    with open(args.convergence_output, "w") as f:
+        f.write("kind,epoch,step,global_step,elapsed_time_s,loss,top1,lr,samples_seen\n")
 
 if args.cuda:
     torch.cuda.set_device(local_rank)
@@ -120,7 +129,7 @@ if args.cuda:
     torch.cuda.manual_seed(seed)
 
 RANK_SCHEDULES = {
-    None: None,
+    "fixed": None,
     "update_norm_stable": None,
     "aggressive": {
         0: args.compress_rank,
@@ -258,6 +267,29 @@ def log(message):
         print(message, flush=True)
 
 
+run_start_time = time.perf_counter()
+global_train_step = 0
+
+
+def record_convergence(kind, epoch, step, global_step, loss, top1, lr, samples_seen):
+    if hvd.rank() != 0:
+        return
+    elapsed_time_s = time.perf_counter() - run_start_time
+    loss_text = "" if loss is None else "%.9f" % float(loss)
+    top1_text = "" if top1 is None else "%.6f" % float(top1)
+    print(
+        "CONVERGENCE kind=%s epoch=%d step=%d global_step=%d elapsed_time_s=%.6f loss=%s top1=%s lr=%.8g samples_seen=%d"
+        % (kind, epoch, step, global_step, elapsed_time_s, loss_text, top1_text, lr, samples_seen),
+        flush=True,
+    )
+    if args.convergence_output:
+        with open(args.convergence_output, "a") as f:
+            f.write(
+                "%s,%d,%d,%d,%.9f,%s,%s,%.12g,%d\n"
+                % (kind, epoch, step, global_step, elapsed_time_s, loss_text, top1_text, lr, samples_seen)
+            )
+
+
 def accuracy(output, target):
     pred = output.argmax(dim=1)
     correct = pred.eq(target).float().sum()
@@ -322,6 +354,7 @@ train_loader, test_loader, train_sampler = build_dataloaders()
 
 
 def train_one_epoch(epoch):
+    global global_train_step
     model.train()
     train_sampler.set_epoch(epoch)
     running_loss = 0.0
@@ -338,7 +371,21 @@ def train_one_epoch(epoch):
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item()
+        loss_value = float(loss.detach().item())
+        global_train_step += 1
+        samples_seen = int(global_train_step * args.batch_size * hvd.size())
+        running_loss += loss_value
+        if args.convergence_log_every > 0 and global_train_step % args.convergence_log_every == 0:
+            record_convergence(
+                "train",
+                epoch,
+                step,
+                global_train_step,
+                loss_value,
+                None,
+                lr,
+                samples_seen,
+            )
         if step % args.print_freq == 0 or step == len(train_loader):
             log(
                 "Epoch {:03d} Step {:04d}/{:04d} lr {:.5f} loss {:.4f}".format(
@@ -375,6 +422,17 @@ def evaluate(epoch):
     avg_loss = (loss_total / sample_total).item()
     top1 = (correct_total / sample_total * 100.0).item()
     log("Epoch {:03d} validation loss {:.4f} top1 {:.2f}%".format(epoch, avg_loss, top1))
+    if args.convergence_output:
+        record_convergence(
+            "validation",
+            epoch,
+            0,
+            global_train_step,
+            avg_loss,
+            top1,
+            optimizer.param_groups[0].get("lr", 0.0),
+            int(global_train_step * args.batch_size * hvd.size()),
+        )
 
 
 log(

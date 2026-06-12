@@ -22,6 +22,15 @@ stable_rank_levels="${stable_rank_levels:-}"
 rank_reset_on_change="${rank_reset_on_change:-0}"
 active_prefix_enabled="${active_prefix_enabled:-1}"
 embedding_policy="${embedding_policy:-word}"
+num_warmup_batches="${num_warmup_batches:-}"
+num_batches_per_iter="${num_batches_per_iter:-}"
+num_iters="${num_iters:-}"
+loss_log_every="${loss_log_every:-0}"
+convergence_log_every="${convergence_log_every:-0}"
+convergence_output="${convergence_output:-}"
+epochs="${epochs:-}"
+print_freq="${print_freq:-}"
+dear_event_sync="${dear_event_sync:-${DEAR_EVENT_SYNC:-1}}"
 senlen="${senlen:-64}"
 rdma="${rdma:-0}"
 nstreams="${nstreams:-1}"
@@ -40,6 +49,7 @@ overlap_warmup="${overlap_warmup:-0}"
 overlap_dir="${overlap_dir:-./overlap_logs}"
 overlap_output="${overlap_output:-}"
 overlap_timeline_output="${overlap_timeline_output:-}"
+export DEAR_EVENT_SYNC="$dear_event_sync"
 source ../configs/envs.conf
 
 ### ----------------------------------------获取节点主机名----------------------------------------
@@ -160,11 +170,49 @@ append_acpr_args() {
     echo "$current"
 }
 
+append_benchmark_args() {
+    local current="$1"
+    if [ -n "$num_warmup_batches" ]; then
+        current="$current --num-warmup-batches $num_warmup_batches"
+    fi
+    if [ -n "$num_batches_per_iter" ]; then
+        current="$current --num-batches-per-iter $num_batches_per_iter"
+    fi
+    if [ -n "$num_iters" ]; then
+        current="$current --num-iters $num_iters"
+    fi
+    if [ "$loss_log_every" != "0" ]; then
+        current="$current --loss-log-every $loss_log_every"
+    fi
+    if [ -n "$convergence_output" ]; then
+        current="$current --convergence-output $convergence_output"
+    fi
+    echo "$current"
+}
+
+append_cifar_args() {
+    local current="$1"
+    if [ -n "$epochs" ]; then
+        current="$current --epochs $epochs"
+    fi
+    if [ -n "$print_freq" ]; then
+        current="$current --print-freq $print_freq"
+    fi
+    if [ "$convergence_log_every" != "0" ]; then
+        current="$current --convergence-log-every $convergence_log_every"
+    fi
+    if [ -n "$convergence_output" ]; then
+        current="$current --convergence-output $convergence_output"
+    fi
+    echo "$current"
+}
+
 # 前面层层包装起来，cmd{benchfile{选模型}}
 if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile="bert_benchmark.py --model $dnn --sentence-len $senlen --exclude-parts $exclude_parts"
     benchfile=$(append_overlap_args "$benchfile")
     benchfile=$(append_acpr_args "$benchfile")
+    benchfile=$(append_benchmark_args "$benchfile")
 elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn" = "cifar100_resnet18" ] || [ "$dnn" = "cifar100_vgg16" ]; then
     benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts --data-dir $data_dir"
     if [ "$download_dataset" = "1" ]; then
@@ -172,6 +220,7 @@ elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn"
     fi
     benchfile=$(append_overlap_args "$benchfile")
     benchfile=$(append_acpr_args "$benchfile")
+    benchfile=$(append_cifar_args "$benchfile")
 else
     benchfile="imagenet_benchmark.py --model $dnn --exclude-parts $exclude_parts"
 fi
@@ -214,6 +263,7 @@ $MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile ../configs/cluster
     -x NCCL_SOCKET_IFNAME=${ETH_INTERFACE} \
     -x NCCL_IB_DISABLE=0 \
     -x NCCL_LAUNCH_MODE=PARALLEL \
+    -x DEAR_EVENT_SYNC \
     -x WFSGD_TIMELINE=${WFSGD_TIMELINE} \
     $cmd
 elif [ "$rdma" = "1" ]; then
@@ -229,6 +279,7 @@ $MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile ../configs/cluster
     -x NCCL_SOCKET_IFNAME=${IB_INTERFACE} \
     -x NCCL_DEBUG=INFO \
     -x NCCL_LAUNCH_MODE=PARALLEL \
+    -x DEAR_EVENT_SYNC \
     -x WFSGD_TIMELINE=${WFSGD_TIMELINE} \
     $cmd
 else
@@ -248,6 +299,7 @@ $MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile ../configs/cluster
     -x NCCL_NET_GDR_READ=0 \
     -x NCCL_IB_CUDA_SUPPORT=0 \
     -x NCCL_LAUNCH_MODE=PARALLEL \
+    -x DEAR_EVENT_SYNC \
     -x WFSGD_TIMELINE=${WFSGD_TIMELINE} \
     $cmd
 fi
