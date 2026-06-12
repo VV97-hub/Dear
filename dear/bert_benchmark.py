@@ -53,7 +53,7 @@ parser.add_argument('--num-warmup-batches', type=int, default=10,
                     help='number of warm-up batches that don\'t count towards benchmark')
 parser.add_argument('--num-batches-per-iter', type=int, default=10,
                     help='number of batches per benchmark iteration')
-parser.add_argument('--num-iters', type=int, default=500,
+parser.add_argument('--num-iters', type=int, default=1000,
                     help='number of benchmark iterations')
 
 parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -95,7 +95,9 @@ parser.add_argument('--overlap-console', type=int, default=1,
 parser.add_argument('--compress-rank', type=int, default=16)
 parser.add_argument('--compress-rank-overrides', type=str, default='',
                     help='comma-separated parameter-specific rank overrides, e.g. name=32,other=16')
-parser.add_argument('--compress-warmup', type=int, default=100)
+parser.add_argument('--compress-warmup', type=int, default=5000)
+parser.add_argument('--compress-refresh-k', type=int, default=1, # 默认 0，表示不开启刷新。
+                    help='every K compressed steps run a two-AllReduce P/Q refresh; 0 disables')
 parser.add_argument('--compress-min-numel', type=int, default=16384,
                     help='do not apply low-rank compression when tensor.numel() is below this threshold')
 # rank_schedule 用字符串表示预设方案，不在命令行里写dict
@@ -505,7 +507,7 @@ if hvd.size() > 1:
     update_norm_smoothing=args.update_norm_smoothing,
     update_norm_debug_every=args.update_norm_debug_every,), 
 
-    is_sparse=args.density<1, density=args.density, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=1, threshold=args.threshold, writer=None, gradient_path='./', fp16=args.fp16, mgwfbp=args.mgwfbp, rdma=args.rdma, exclude_parts=args.exclude_parts)
+    is_sparse=args.density<1, density=args.density, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=1, threshold=args.threshold, writer=None, gradient_path='./', fp16=args.fp16, mgwfbp=args.mgwfbp, rdma=args.rdma, exclude_parts=args.exclude_parts, refresh_k=args.compress_refresh_k)
     
     # Horovod: broadcast parameters & optimizer state.
     hvd.broadcast_parameters(model.state_dict(), root_rank=0)

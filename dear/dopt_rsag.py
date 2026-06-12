@@ -37,6 +37,8 @@ comm_init()
 comm = None
 all_gather_comm = None
 reduce_scatter_comm = None
+refresh_first_comm = None
+refresh_second_comm = None
 
 # Please set THRESHOLD=None and NUM_NEARBY_LAYERS=1 to disable tensor fusion for notf experiments. 
 # 上面的参数设置是禁用 notf 实验中的张量融合功能。
@@ -50,6 +52,15 @@ def init():
     comm = Communicator(NSTREAMS)
     reduce_scatter_comm = CommReduceScatter(op=CollectiveOp.REDUCE_SCATTER)
     all_gather_comm = CommReduceScatter(op=CollectiveOp.ALL_GATHER)
+
+
+def init_refresh_comms():
+    global refresh_first_comm
+    global refresh_second_comm
+    if refresh_first_comm is not None:
+        return
+    refresh_first_comm = Communicator(NSTREAMS)
+    refresh_second_comm = Communicator(NSTREAMS)
 
 
 DEBUG = False
@@ -661,7 +672,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             num_nearby_layers=NUM_NEARBY_LAYERS, 
             threshold=THRESHOLD, 
             exclude_parts='',
-            compression=None):  # 添加 compression 参数（压缩新增）
+            compression=None,
+            refresh_k=0):  # 添加 compression 参数（压缩新增）
         r"""Distributed optimizer with overlapping reduceScatter and allGather and tensor fusion.
 
         Args:
@@ -676,7 +688,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._num_steps = 0
         self._grad_accs = []
         self._compression = compression  # 保存为实例属性（压缩新增）
+        self._refresh_k = int(refresh_k or 0)
+        if self._refresh_k > 0:
+            init_refresh_comms()
         self._active_compression_factor = None
+        self._step_update_done = False
         self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
         self._overlap_profiler = OverlapProfiler(
             enabled=os.environ.get('DEAR_OVERLAP_PROFILE', '0') == '1',
@@ -952,6 +968,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             ]
 
         self._overlap_profiler.set_topology(topology_module_groups, group_stats=group_stats)
+        self._refresh_first_handles = [None] * self._num_groups
+        self._refresh_second_handles = [None] * self._num_groups
+        self._refresh_first_done = [False] * self._num_groups
+        self._refresh_second_done = [False] * self._num_groups
+        self._refresh_first_kind = None
+        self._refresh_second_kind = None
+        self._refresh_launch_order = []
+        self._refresh_next_second_pos = 0
+        self._refresh_pending_first_groups = []
         
     @torch.no_grad()
     def _get_pad_tensor(self, tensor, numel, size): 
@@ -1083,6 +1108,240 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         if padded_size > total_size:
             pad_buffers[group_idx][total_size:padded_size].zero_()
 
+    def _is_refresh_step(self):
+        if not self._compression or self._refresh_k <= 0:
+            return False
+        if self._num_steps <= self._compression.warmup_steps:
+            return False
+        return (self._num_steps - self._compression.warmup_steps) % self._refresh_k == 0
+
+    def _other_factor_kind(self, factor_kind):
+        return 'q' if factor_kind == 'p' else 'p'
+
+    def _refresh_push_to_buffer(self, name, tensor):
+        group_idx, sub_idx, start_p, end_p = self._param_group_idx[name]
+        with torch.no_grad():
+            self._pad_buffers[group_idx][start_p:end_p].copy_(tensor.view(-1))
+            self._param_group_flags[group_idx][sub_idx] = 1
+            for flag in self._param_group_flags[group_idx]:
+                if flag == 0:
+                    return
+            self._refresh_pending_first_groups.append(group_idx)
+
+    def _refresh_launch_first_group(self, group_idx):
+        step = self._num_steps
+        first_kind = self._compression_factor_kind(step)
+        self._refresh_first_kind = first_kind
+        self._refresh_second_kind = self._other_factor_kind(first_kind)
+        self._prepare_active_compression_layout(step, first_kind)
+        offsets = self._compression_offsets_for_factor(first_kind)
+        pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
+        pad_buf = pad_buffers[group_idx]
+        group_size = self._active_group_sizes_for_factor(first_kind)[0][group_idx]
+        if group_size > 0:
+            pad_buf[:group_size].zero_()
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            _, _, raw_start, raw_end = self._param_group_idx[name]
+            raw_grad = self._pad_buffers[group_idx][raw_start:raw_end].view(p.shape)
+            vector = self._compression.compute_factor(
+                raw_grad,
+                name,
+                step=step,
+                factor_kind=first_kind,
+                update_residual=False,
+            )
+            _, start, end = offsets[name]
+            actual_end = start + vector.numel()
+            pad_buf[start:actual_end].copy_(vector.view(-1))
+            if actual_end < end:
+                pad_buf[actual_end:end].zero_()
+        self._zero_active_padding_for_factor(first_kind, group_idx)
+        pad_view, _ = self._compression_group_buffer_views_for_factor(first_kind, group_idx)
+        if hasattr(refresh_first_comm, 'waitCurrentStream'):
+            refresh_first_comm.waitCurrentStream()
+        else:
+            torch.cuda.current_stream(device=pad_view.device).synchronize()
+        handle = refresh_first_comm.allReduce(pad_view)
+        self._refresh_first_handles[group_idx] = -1 if handle is None else handle
+        self._refresh_launch_order.append(group_idx)
+
+    def _refresh_load_factor_group(self, group_idx, factor_kind):
+        offsets = self._compression_offsets_for_factor(factor_kind)
+        pad_buffers, _ = self._compression_buffers_for_factor(factor_kind)
+        pad_buf = pad_buffers[group_idx]
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            if not self._compression.should_compress_tensor(p, name=name):
+                continue
+            rank_c = self._compression.get_rank_for(name, p.shape)
+            curr_size = self._compression.get_factor_numel(
+                p.shape,
+                name=name,
+                factor_kind=factor_kind,
+                rank=rank_c,
+            )
+            _, start, _ = offsets[name]
+            self._compression.load_factor(
+                pad_buf[start:start + curr_size],
+                p.size(),
+                name,
+                step=self._num_steps,
+                factor_kind=factor_kind,
+            )
+
+    def _refresh_launch_second_group(self, group_idx):
+        step = self._num_steps
+        second_kind = self._refresh_second_kind
+        self._prepare_active_compression_layout(step, second_kind)
+        offsets = self._compression_offsets_for_factor(second_kind)
+        pad_buffers, _ = self._compression_buffers_for_factor(second_kind)
+        pad_buf = pad_buffers[group_idx]
+        group_size = self._active_group_sizes_for_factor(second_kind)[0][group_idx]
+        if group_size > 0:
+            pad_buf[:group_size].zero_()
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            if not self._compression.should_compress_tensor(p, name=name):
+                continue
+            _, _, raw_start, raw_end = self._param_group_idx[name]
+            raw_grad = self._pad_buffers[group_idx][raw_start:raw_end].view(p.shape)
+            vector = self._compression.compute_factor(
+                raw_grad,
+                name,
+                step=step,
+                factor_kind=second_kind,
+                update_residual=False,
+            )
+            _, start, end = offsets[name]
+            actual_end = start + vector.numel()
+            pad_buf[start:actual_end].copy_(vector.view(-1))
+            if actual_end < end:
+                pad_buf[actual_end:end].zero_()
+        self._zero_active_padding_for_factor(second_kind, group_idx)
+        pad_view, _ = self._compression_group_buffer_views_for_factor(second_kind, group_idx)
+        if hasattr(refresh_second_comm, 'waitCurrentStream'):
+            refresh_second_comm.waitCurrentStream()
+        else:
+            torch.cuda.current_stream(device=pad_view.device).synchronize()
+        handle = refresh_second_comm.allReduce(pad_view)
+        self._refresh_second_handles[group_idx] = -1 if handle is None else handle
+
+    def _refresh_finish_first_group(self, group_idx, blocking=False):
+        handle = self._refresh_first_handles[group_idx]
+        if handle is None or self._refresh_first_done[group_idx]:
+            return self._refresh_first_done[group_idx]
+        if handle == -1:
+            if not blocking:
+                return False
+            refresh_first_comm.synchronize()
+        elif blocking:
+            refresh_first_comm.syncEvent(handle)
+        elif hasattr(refresh_first_comm, 'queryEvent'):
+            if not refresh_first_comm.queryEvent(handle):
+                return False
+            refresh_first_comm.syncEvent(handle)
+        else:
+            return False
+        first_kind = self._refresh_first_kind
+        first_pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
+        first_pad_buffers[group_idx].div_(size())
+        self._refresh_load_factor_group(group_idx, first_kind)
+        self._refresh_first_done[group_idx] = True
+        return True
+
+    def _refresh_finish_second_group(self, group_idx, blocking=False):
+        handle = self._refresh_second_handles[group_idx]
+        if handle is None or self._refresh_second_done[group_idx]:
+            return self._refresh_second_done[group_idx]
+        if handle == -1:
+            if not blocking:
+                return False
+            refresh_second_comm.synchronize()
+        elif blocking:
+            refresh_second_comm.syncEvent(handle)
+        elif hasattr(refresh_second_comm, 'queryEvent'):
+            if not refresh_second_comm.queryEvent(handle):
+                return False
+            refresh_second_comm.syncEvent(handle)
+        else:
+            return False
+        second_kind = self._refresh_second_kind
+        second_pad_buffers, _ = self._compression_buffers_for_factor(second_kind)
+        second_pad_buffers[group_idx].div_(size())
+        self._refresh_load_factor_group(group_idx, second_kind)
+        self._refresh_second_done[group_idx] = True
+        return True
+
+    def _refresh_progress(self, blocking=False):
+        while True:
+            made_progress = False
+            for group_idx in self._refresh_launch_order:
+                if (
+                    not self._refresh_first_done[group_idx]
+                    and self._refresh_finish_first_group(group_idx, blocking=blocking)
+                ):
+                    made_progress = True
+            while self._refresh_next_second_pos < len(self._refresh_launch_order):
+                group_idx = self._refresh_launch_order[self._refresh_next_second_pos]
+                if not self._refresh_first_done[group_idx]:
+                    break
+                self._refresh_launch_second_group(group_idx)
+                self._refresh_next_second_pos += 1
+                made_progress = True
+            if (
+                self._refresh_next_second_pos == len(self._refresh_launch_order)
+                and self._refresh_pending_first_groups
+            ):
+                self._refresh_launch_first_group(self._refresh_pending_first_groups.pop(0))
+                made_progress = True
+            if not made_progress:
+                break
+        for group_idx in self._refresh_launch_order:
+            self._refresh_finish_second_group(group_idx, blocking=blocking)
+
+    def _refresh_update_group(self, group_idx):
+        first_kind = self._refresh_first_kind
+        first_offsets = self._compression_offsets_for_factor(first_kind)
+        first_pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
+        first_pad_buf = first_pad_buffers[group_idx]
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            _, _, raw_start, raw_end = self._param_group_idx[name]
+            raw_grad = self._pad_buffers[group_idx][raw_start:raw_end].view(p.shape)
+            if self._compression.should_compress_tensor(p, name=name):
+                grad = self._compression.reconstruct_from_memory(p.size(), name)
+                self._compression.update_residual_from_memory(raw_grad, name)
+            else:
+                _, start, end = first_offsets[name]
+                grad = first_pad_buf[start:end].view(p.shape).clone()
+            self._sgd(p, grad)
+
+    def _refresh_drain(self):
+        if not self._refresh_launch_order and not self._refresh_pending_first_groups:
+            return
+        self._refresh_progress(blocking=True)
+        for group_idx, done in enumerate(self._refresh_second_done):
+            if not done:
+                continue
+            self._refresh_update_group(group_idx)
+        self._refresh_first_handles = [None] * self._num_groups
+        self._refresh_second_handles = [None] * self._num_groups
+        self._refresh_first_done = [False] * self._num_groups
+        self._refresh_second_done = [False] * self._num_groups
+        self._refresh_first_kind = None
+        self._refresh_second_kind = None
+        self._refresh_launch_order = []
+        self._refresh_next_second_pos = 0
+        self._refresh_pending_first_groups = []
+        if hasattr(refresh_first_comm, 'clearEvents'):
+            refresh_first_comm.clearEvents()
+        if hasattr(refresh_second_comm, 'clearEvents'):
+            refresh_second_comm.clearEvents()
+        for group_idx in range(len(self._param_group_flags)):
+            self._param_group_flags[group_idx] = [0] * len(self._param_group_flags[group_idx])
+        self._module_group_flags = [0] * self._num_groups
+
     def profile_step_begin(self):
         self._overlap_profiler.begin_step(self._num_steps)
 
@@ -1184,7 +1443,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             # -------------------------------------------------------上面的代码加上之后 baseline不报NaN-------------------------------------------------------
             tensor = grad   # ✅ 用这个！！！
 
-            if self._compression and self._num_steps > self._compression.warmup_steps:
+            if self._is_refresh_step():
+                self._refresh_push_to_buffer(name, tensor)
+                self._refresh_progress(blocking=False)
+            elif self._compression and self._num_steps > self._compression.warmup_steps:
                 factor_kind = self._compression_factor_kind(self._num_steps)
                 self._prepare_active_compression_layout(self._num_steps, factor_kind)
                 compressed_offsets = self._compression_offsets_for_factor(factor_kind)
@@ -1294,7 +1556,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         """
         Add hooks for pre-feedfoward.
         """
-        if torch.is_grad_enabled() and self._num_steps > 0:
+        if torch.is_grad_enabled() and self._num_steps > 0 and not self._step_update_done:
             name = self._module_names.get(module)
             group_idx, sub_idx = self._module_group_idx[name]
 
@@ -1338,7 +1600,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 )
 
     def _forward_hook(self, module, input, output):
-        if torch.is_grad_enabled() and self._num_steps > 0:
+        if torch.is_grad_enabled() and self._num_steps > 0 and not self._step_update_done:
             name = self._module_names.get(module)
             group_idx, sub_idx = self._module_group_idx[name]
             if sub_idx == self._group_module_counts[group_idx] - 1:
@@ -1608,6 +1870,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         Synchronize the reduce-scatter operations and start the all-gather on the first group.
         """
         # 计时（所有 reduce-scatter 通信 + 被 overlap 剩下的尾巴）  = RS_total_time − backward_overlap_time
+        self._step_update_done = False
         # 所有RS的同步操作
         rs_sync_start = time.perf_counter()
         strict_profile_sync = (
@@ -1677,7 +1940,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         Performs a single optimization step.
         """
         if size() > 1:
-            self._bp_barrier()
+            if self._is_refresh_step():
+                self._refresh_drain()
+                self._step_update_done = True
+            else:
+                self._bp_barrier()
         #else:
         #    todo: step with non-distributed optimzier
         # Note: the last step is skipped
@@ -1691,7 +1958,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         #print("test tensor after:", test_tensor)
 
 # 将任意 PyTorch Optimizer 动态包装成 DeAR 分布式优化器
-def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, fp16=False, mgwfbp=False, rdma=False, multi_job_scheduling=False, exclude_parts=''):
+def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, fp16=False, mgwfbp=False, rdma=False, multi_job_scheduling=False, exclude_parts='', refresh_k=0):
     """
     Wrap optimizer to gurantee the consistency. 
     Warning: some functions are not supported now, so we will simply skip these parameters.
@@ -1708,7 +1975,7 @@ def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, de
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
 
-    return cls(optimizer.param_groups, model, exclude_parts=exclude_parts,compression=compression) # 原本compression参数是没有要的（压缩新增）
+    return cls(optimizer.param_groups, model, exclude_parts=exclude_parts,compression=compression, refresh_k=refresh_k) # 原本compression参数是没有要的（压缩新增）
 
 def broadcast_parameters(params, root_rank):
     """

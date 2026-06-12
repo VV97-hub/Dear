@@ -179,6 +179,21 @@ void Communicator::syncEvent(int handler) {
     }
 }
 
+bool Communicator::queryEvent(int handler) {
+    if (handler < 0 || handler >= static_cast<int>(m_op_events.size()) || m_op_events[handler] == nullptr) {
+        return true;
+    }
+    cudaError_t status = cudaEventQuery(m_op_events[handler]);
+    if (status == cudaSuccess) {
+        return true;
+    }
+    if (status == cudaErrorNotReady) {
+        return false;
+    }
+    CUDACHECK(status);
+    return false;
+}
+
 float Communicator::syncEventElapsedFromBase(int handler) {
     float elapsed_ms = -1.0f;
     if (handler >= 0 && handler < static_cast<int>(m_op_events.size()) && m_op_events[handler] != nullptr) {
@@ -366,11 +381,22 @@ void Communicator::allReduceRSAG(torch::Tensor tensor) {
     m_current_comm %= m_num_comms;
 }
 
-void Communicator::allReduce(torch::Tensor tensor) {
-    NCCLCHECK(ncclAllReduce(tensor.data_ptr<float>(), tensor.data_ptr<float>(), tensor.numel(), ncclFloat, ncclSum, m_nccl_comms[m_current_comm], m_streams[m_current_comm]));
-    //CUDACHECK(cudaEventRecord(m_events[m_current_comm], m_streams[m_current_comm]));
+int Communicator::allReduce(torch::Tensor tensor) {
+    int current_comm = m_current_comm;
+    if (!m_op_base_event_recorded) {
+        CUDACHECK(cudaEventRecord(m_op_base_event, m_streams[current_comm]));
+        m_op_base_event_recorded = true;
+    }
+    NCCLCHECK(ncclAllReduce(tensor.data_ptr<float>(), tensor.data_ptr<float>(), tensor.numel(), ncclFloat, ncclSum, m_nccl_comms[current_comm], m_streams[current_comm]));
+    cudaEvent_t event;
+    CUDACHECK(cudaEventCreate(&event));
+    CUDACHECK(cudaEventRecord(event, m_streams[current_comm]));
+    m_op_events.push_back(event);
+    int handler = static_cast<int>(m_op_events.size()) - 1;
     m_current_comm++;
     m_current_comm %= m_num_comms;
+    m_sync_flags[current_comm] = false;
+    return handler;
 }
 
 void Communicator::multiBcast(vector<torch::Tensor> &tensor_list, vector<torch::Tensor> &output_list, const std::function<void(torch::Tensor, torch::Tensor)> &op) {

@@ -1,6 +1,7 @@
 """本备份是一轮传p一轮传q的powersgd的备份2026/4/2，下一步打算试试一轮内同时传p和q的powersgd"""
 # -*- coding: utf-8 -*-
 from __future__ import print_function
+import os
 import torch
 import numpy as np
 import time
@@ -101,6 +102,8 @@ class HalfRankKReducer(Reducer):
         self.global_update_norm_last = None
         self.global_update_norm_stable_count = 0
         self._global_update_norm_observation = None
+        self._debug_print_pq_shapes = os.environ.get('DEAR_PRINT_PQ_SHAPES', '0') == '1' # 输出P和Q的维度大小
+        self._debug_printed_pq_shapes = set()
 
         self.name = 'halfrankk'
 
@@ -474,6 +477,134 @@ class HalfRankKReducer(Reducer):
         vector.data[:] = torch.randn(*vector.shape, device=self.device)
         self._orthogonalize_factor(vector)
 
+    def _prepare_tensor_memory(self, tensor, name=None, step=0):
+        if name is None:
+            name = 'default'
+        grad_matrix = tensor.reshape(tensor.shape[0], -1)
+        n, m = grad_matrix.shape
+        rank = self._get_rank(
+            step, n, m, name=name, shape=tensor.shape, device=tensor.device
+        )
+        max_rank = max(1, min(n, m, self.max_rank_for(name)))
+        key = (name, tuple(tensor.shape))
+        old_rank = self.rank_memory.get(key, None)
+        self._maybe_reset_memory(key, rank, step=step, name=name)
+        if key not in self.residuals:
+            self.residuals[key] = torch.zeros_like(grad_matrix)
+        if key not in self.p_memory:
+            self.p_memory[key] = torch.zeros(n, max_rank, device=tensor.device)
+            self.q_memory[key] = torch.zeros(m, max_rank, device=tensor.device)
+            self.max_rank_memory[key] = max_rank
+            self.set_random(self.p_memory[key])
+            self.set_random(self.q_memory[key])
+        elif self.max_rank_memory.get(key) != max_rank:
+            raise RuntimeError(
+                'Nested rank max changed for %s: old=%s new=%s. '
+                'Increase default max rank before training instead of changing it at runtime.'
+                % (name, self.max_rank_memory.get(key), max_rank)
+            )
+        if old_rank is not None and rank > old_rank:
+            self._orthogonalize_new_columns(self.p_memory[key], old_rank, rank)
+            self._orthogonalize_new_columns(self.q_memory[key], old_rank, rank)
+        p = self.p_memory[key][:, :rank]
+        q = self.q_memory[key][:, :rank]
+        return grad_matrix, key, rank, p, q
+
+    def _debug_log_pq_shapes(self, name, tensor_shape, n, m, rank, step, factor_kind):
+        if not self._debug_print_pq_shapes:
+            return
+        worker_rank = int(os.environ.get('OMPI_COMM_WORLD_RANK', os.environ.get('RANK', '0')))
+        if worker_rank != 0:
+            return
+        key = (name, tuple(tensor_shape), int(rank), factor_kind)
+        if key in self._debug_printed_pq_shapes:
+            return
+        self._debug_printed_pq_shapes.add(key)
+        print(
+            "[HalfRankK][P/Q shape] step=%s factor=%s name=%s "
+            "G=%s matrix=(%d,%d) rank=%d P=(%d,%d) Q=(%d,%d)"
+            % (
+                step,
+                factor_kind,
+                name,
+                tuple(tensor_shape),
+                n,
+                m,
+                rank,
+                n,
+                rank,
+                m,
+                rank,
+            ),
+            flush=True,
+        )
+
+    def compute_factor(self, tensor, name=None, step=0, factor_kind=None, update_residual=True):
+        if not self.should_compress_tensor(tensor, name=name):
+            return tensor.contiguous().clone()
+        if factor_kind is None:
+            factor_kind = self.factor_kind(step)
+        grad_matrix, key, rank, p, q = self._prepare_tensor_memory(tensor, name, step)
+        matrix = grad_matrix + self.residuals[key]
+        self._debug_log_pq_shapes(
+            name,
+            tensor.shape,
+            grad_matrix.shape[0],
+            grad_matrix.shape[1],
+            rank,
+            step,
+            factor_kind,
+        )
+        with torch.no_grad():
+            if factor_kind == 'p':
+                self._orthogonalize_factor(q)
+                p.copy_(torch.matmul(matrix, q))
+                compressed = p.contiguous().clone()
+            else:
+                self._orthogonalize_factor(p)
+                q.copy_(torch.matmul(matrix.t(), p))
+                compressed = q.contiguous().clone()
+            if update_residual:
+                self.residuals[key].copy_(matrix - p @ q.t())
+        return compressed
+
+    def load_factor(self, compressed_data, original_tensor_size, name, step=0, factor_kind=None):
+        if not self.should_compress_shape(original_tensor_size, name=name):
+            return
+        key = (name, tuple(original_tensor_size))
+        rank = self.rank_memory.get(key, self.max_rank_for(name))
+        p = self.p_memory[key][:, :rank]
+        q = self.q_memory[key][:, :rank]
+        if factor_kind is None:
+            factor_kind = self.factor_kind_for_update(step)
+        with torch.no_grad():
+            if factor_kind == 'p':
+                p.copy_(compressed_data.view(p.shape))
+            else:
+                q.copy_(compressed_data.view(q.shape))
+
+    def reconstruct_from_memory(self, original_tensor_size, name):
+        if not self.should_compress_shape(original_tensor_size, name=name):
+            return None
+        key = (name, tuple(original_tensor_size))
+        rank = self.rank_memory.get(key, self.max_rank_for(name))
+        p = self.p_memory[key][:, :rank]
+        q = self.q_memory[key][:, :rank]
+        return (p @ q.t()).view(original_tensor_size)
+
+    def update_residual_from_memory(self, tensor, name):
+        if not self.should_compress_tensor(tensor, name=name):
+            return
+        key = (name, tuple(tensor.shape))
+        if key not in self.residuals:
+            return
+        grad_matrix = tensor.reshape(tensor.shape[0], -1)
+        rank = self.rank_memory.get(key, self.max_rank_for(name))
+        p = self.p_memory[key][:, :rank]
+        q = self.q_memory[key][:, :rank]
+        with torch.no_grad():
+            self.residuals[key].copy_(grad_matrix + self.residuals[key] - p @ q.t())
+
     def compress(self, tensor, name=None, step=0, **kwargs):
         """
         对单个tensor执行半步PowerSGD压缩（奇偶步交替算p/q）。
@@ -487,74 +618,13 @@ class HalfRankKReducer(Reducer):
             # 一维tensor不压缩（如bias），直接透传
             return tensor, None, None
 
-        if name is None:
-            name = 'default'
-
-        # reshape为二维矩阵：第0维保持，其余flatten
-        grad_matrix = tensor.reshape(tensor.shape[0], -1)
-        n, m = grad_matrix.shape
-
-        # ---- 动态rank核心：计算本轮rank并按需重建内存 ----
-        rank = self._get_rank(
-            step, n, m, name=name, shape=tensor.shape, device=tensor.device
-        )
-        max_rank = max(1, min(n, m, self.max_rank_for(name)))
-        # key同时包含shape，防止同name不同shape的tensor复用同一内存
-        key = (name, tuple(tensor.shape))
-        old_rank = self.rank_memory.get(key, None)
-        # 记录rank变化；nested subspace下不清除旧内存（含residual）
-        self._maybe_reset_memory(key, rank, step=step, name=name)
-        # ---- 动态rank核心结束 ----
-
-        # [EF] 初始化residual（首次或rank切换后重建）
-        if key not in self.residuals:
-            self.residuals[key] = torch.zeros_like(grad_matrix)
-
-
-        # [EF] 使用“梯度 + 历史残差”作为本轮被压缩目标。
-        # 这里保持 ACP-SGD 语义：残差在本地压缩阶段更新，而不是等通信后再更新。
-        residual = self.residuals[key]
-        matrix = grad_matrix + residual
-
-        # 初始化p/q母空间（首次按最大rank创建，rank变化时复用前缀列）
-        if key not in self.p_memory:
-            self.p_memory[key] = torch.zeros(n, max_rank, device=tensor.device)
-            self.q_memory[key] = torch.zeros(m, max_rank, device=tensor.device)
-            self.max_rank_memory[key] = max_rank
-            self.set_random(self.p_memory[key])
-            self.set_random(self.q_memory[key])
-        elif self.max_rank_memory.get(key) != max_rank:
-            raise RuntimeError(
-                'Nested rank max changed for %s: old=%s new=%s. '
-                'Increase default max rank before training instead of changing it at runtime.'
-                % (name, self.max_rank_memory.get(key), max_rank)
-            )
-
-        if old_rank is not None and rank > old_rank:
-            self._orthogonalize_new_columns(self.p_memory[key], old_rank, rank)
-            self._orthogonalize_new_columns(self.q_memory[key], old_rank, rank)
-
-        p_full = self.p_memory[key]
-        q_full = self.q_memory[key]
-        p = p_full[:, :rank]
-        q = q_full[:, :rank]
-
-        # 压缩计算在no_grad下进行，避免污染反向传播计算图
-        with torch.no_grad():
-            if self.is_p_step(step):
-                # 偶数步：用当前q投影，计算p = M @ q
-                self._orthogonalize_factor(q)
-                p.copy_(torch.matmul(matrix, q))
-                reconstructed = p @ q.t()
-                residual.copy_(matrix - reconstructed)
-                return p.contiguous().clone(), None, None
-            else:
-                # 奇数步：用当前p投影，计算q = M^T @ p
-                self._orthogonalize_factor(p)
-                q.copy_(torch.matmul(matrix.t(), p))
-                reconstructed = p @ q.t()
-                residual.copy_(matrix - reconstructed)
-                return q.contiguous().clone(), None, None
+        return self.compute_factor(
+            tensor,
+            name=name,
+            step=step,
+            factor_kind=self.factor_kind(step),
+            update_residual=True,
+        ), None, None
 
     def decompress(self, compressed_data, original_tensor_size, numel, name, step=0, factor_kind=None):
         """
@@ -574,31 +644,11 @@ class HalfRankKReducer(Reducer):
             # 一维tensor compress时直接透传，decompress同样直接返回
             return compressed_data.view(original_tensor_size)
 
-        key = (name, tuple(original_tensor_size))
-        rank = self.rank_memory.get(key, self.max_rank_for(name))
-        p_full = self.p_memory[key]
-        q_full = self.q_memory[key]
-        p = p_full[:, :rank]
-        q = q_full[:, :rank]
-
         if factor_kind is None:
             factor_kind = self.factor_kind_for_update(step)
 
-        # 注意：dopt_rsag 的 step() 在 backward 之后自增，因此更新阶段使用的是上一轮发送的因子。
-        if factor_kind == 'p':
-            # 奇数step：本轮通信的是p，用allreduce结果覆盖p
-            with torch.no_grad():
-                p.copy_(compressed_data.view(p.shape))
-        else:
-            # 偶数step：本轮通信的是q，用allreduce结果覆盖q
-            with torch.no_grad():
-                q.copy_(compressed_data.view(q.shape))
-
-        # 用通信后的平均因子和本地保留因子重构低秩近似梯度。
-        # 残差已经在 compress() 中按本地压缩误差更新，这里不再覆盖 residual。
-        reconstructed = p @ q.t()
-
-        return reconstructed.view(original_tensor_size)
+        self.load_factor(compressed_data, original_tensor_size, name, step, factor_kind)
+        return self.reconstruct_from_memory(original_tensor_size, name)
         
     # reduce方法废弃不用，输入和输出与要求的不一样
     def reduce(self, grad_in, grad_out, memory_out):

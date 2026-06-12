@@ -63,7 +63,7 @@ public:
 
 	int reduceScatter(torch::Tensor send_tensor, torch::Tensor recv_tensor);
 	int allGather(torch::Tensor send_tensor, torch::Tensor recv_tensor);
-	void allReduce(torch::Tensor tensor);
+	int allReduce(torch::Tensor tensor);
 	void allReduceRB(torch::Tensor tensor);
 	void allReduceRSAG(torch::Tensor tensor);
 
@@ -75,6 +75,7 @@ public:
     void synchronize();
     void syncStream(int handler);
     void syncEvent(int handler);
+    bool queryEvent(int handler);
     float syncEventElapsedFromBase(int handler);
     void waitCurrentStream();
     void waitEvent(Communicator &producer, int handler);
