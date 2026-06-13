@@ -97,6 +97,8 @@ parser.add_argument('--convergence-output', type=str, default='',
                     help='optional rank-0 CSV path for step, elapsed time, loss, lr, and samples')
 parser.add_argument('--comm-stats-output', type=str, default='',
                     help='optional rank-0 CSV path for per-step compressed communication volume')
+parser.add_argument('--comm-stats-every', type=int, default=1,
+                    help='record compressed communication stats every N compressed steps when output is enabled')
 # 动态rank增加：
 parser.add_argument('--compress-rank', type=int, default=16)
 parser.add_argument('--compress-rank-overrides', type=str, default='',
@@ -150,6 +152,7 @@ os.environ['DEAR_OVERLAP_OUTPUT'] = args.overlap_output
 os.environ['DEAR_OVERLAP_TIMELINE_OUTPUT'] = args.overlap_timeline_output
 os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
 os.environ['DEAR_COMM_STATS_OUTPUT'] = args.comm_stats_output
+os.environ['DEAR_COMM_STATS_EVERY'] = str(args.comm_stats_every)
 if args.convergence_output and hvd.rank() == 0:
     convergence_dir = os.path.dirname(args.convergence_output)
     if convergence_dir:

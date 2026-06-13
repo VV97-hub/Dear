@@ -697,6 +697,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._step_update_done = False
         self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
         self._comm_stats_output_path = os.environ.get('DEAR_COMM_STATS_OUTPUT', '')
+        self._comm_stats_every = max(1, int(os.environ.get('DEAR_COMM_STATS_EVERY', '1')))
         self._comm_stats_logged = set()
         if self._comm_stats_output_path and rank() == 0:
             comm_stats_dir = os.path.dirname(self._comm_stats_output_path)
@@ -1174,6 +1175,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             or not self._compression
             or not hasattr(self, '_compressed_pad_buffers_p')
         ):
+            return
+        compressed_step_idx = max(1, int(step) - int(self._compression.warmup_steps))
+        if (compressed_step_idx - 1) % self._comm_stats_every != 0:
             return
         key = (int(step), factor_kind)
         if key in self._comm_stats_logged:
