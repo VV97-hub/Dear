@@ -696,6 +696,19 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._active_compression_factor = None
         self._step_update_done = False
         self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
+        self._comm_stats_output_path = os.environ.get('DEAR_COMM_STATS_OUTPUT', '')
+        self._comm_stats_logged = set()
+        if self._comm_stats_output_path and rank() == 0:
+            comm_stats_dir = os.path.dirname(self._comm_stats_output_path)
+            if comm_stats_dir:
+                os.makedirs(comm_stats_dir, exist_ok=True)
+            with open(self._comm_stats_output_path, 'w') as f:
+                f.write(
+                    'step,factor_kind,active_prefix_enabled,num_groups,'
+                    'logical_active_numel,communicated_numel,padded_communicated_numel,'
+                    'max_numel,max_padded_numel,logical_active_bytes,communicated_bytes,'
+                    'padded_communicated_bytes,max_bytes,max_padded_bytes,current_rank\n'
+                )
         self._overlap_profiler = OverlapProfiler(
             enabled=os.environ.get('DEAR_OVERLAP_PROFILE', '0') == '1',
             summary_enabled=os.environ.get('DEAR_OVERLAP_SUMMARY', '0') == '1',
@@ -1018,29 +1031,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             return self._active_compressed_group_sizes_p, self._active_compressed_padded_group_sizes_p
         return self._active_compressed_group_sizes_q, self._active_compressed_padded_group_sizes_q
 
-    def _prepare_active_compression_layout(self, step, factor_kind):
-        if not self._compression:
-            return
-        if not self._active_prefix_enabled:
-            self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
-            self._active_compressed_param_offsets_q = self._compressed_param_offsets_q
-            self._active_compressed_group_sizes_p = self._compressed_group_sizes_p
-            self._active_compressed_group_sizes_q = self._compressed_group_sizes_q
-            self._active_compressed_padded_group_sizes_p = [
-                buf.numel() for buf in self._compressed_pad_buffers_p
-            ]
-            self._active_compressed_padded_group_sizes_q = [
-                buf.numel() for buf in self._compressed_pad_buffers_q
-            ]
-            self._active_compression_layout_step = step
-            self._active_compression_layout_factor = factor_kind
-            return
-        if (
-            self._active_compression_layout_step == step
-            and self._active_compression_layout_factor == factor_kind
-        ):
-            return
-
+    def _compute_step_compression_layout(self, step):
         active_offsets_p = {}
         active_offsets_q = {}
         group_sizes_p = []
@@ -1079,6 +1070,35 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
             group_sizes_p.append(offset_p)
             group_sizes_q.append(offset_q)
+
+        return active_offsets_p, active_offsets_q, group_sizes_p, group_sizes_q
+
+    def _prepare_active_compression_layout(self, step, factor_kind):
+        if not self._compression:
+            return
+        if not self._active_prefix_enabled:
+            self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
+            self._active_compressed_param_offsets_q = self._compressed_param_offsets_q
+            self._active_compressed_group_sizes_p = self._compressed_group_sizes_p
+            self._active_compressed_group_sizes_q = self._compressed_group_sizes_q
+            self._active_compressed_padded_group_sizes_p = [
+                buf.numel() for buf in self._compressed_pad_buffers_p
+            ]
+            self._active_compressed_padded_group_sizes_q = [
+                buf.numel() for buf in self._compressed_pad_buffers_q
+            ]
+            self._active_compression_layout_step = step
+            self._active_compression_layout_factor = factor_kind
+            return
+        if (
+            self._active_compression_layout_step == step
+            and self._active_compression_layout_factor == factor_kind
+        ):
+            return
+
+        active_offsets_p, active_offsets_q, group_sizes_p, group_sizes_q = (
+            self._compute_step_compression_layout(step)
+        )
 
         def _padded_sizes(group_sizes, max_buffers):
             padded = []
@@ -1125,6 +1145,82 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         padded_size = padded_sizes[group_idx]
         if padded_size > total_size:
             pad_buffers[group_idx][total_size:padded_size].zero_()
+
+    def _current_rank_for_stats(self, step):
+        if not self._compression:
+            return ''
+        if (
+            getattr(self._compression, 'update_norm_stable_rank', False)
+            and
+            hasattr(self._compression, 'stable_rank_levels')
+            and hasattr(self._compression, 'global_rank_level_idx')
+            and self._compression.stable_rank_levels
+        ):
+            idx = int(self._compression.global_rank_level_idx)
+            idx = max(0, min(idx, len(self._compression.stable_rank_levels) - 1))
+            return self._compression.stable_rank_levels[idx]
+        if hasattr(self._compression, '_scheduled_base_rank'):
+            return self._compression._scheduled_base_rank(step)
+        if hasattr(self._compression, 'default_rank'):
+            return self._compression.default_rank
+        if hasattr(self._compression, 'rank'):
+            return self._compression.rank
+        return ''
+
+    def _log_comm_stats(self, step, factor_kind):
+        if (
+            not self._comm_stats_output_path
+            or rank() != 0
+            or not self._compression
+            or not hasattr(self, '_compressed_pad_buffers_p')
+        ):
+            return
+        key = (int(step), factor_kind)
+        if key in self._comm_stats_logged:
+            return
+        self._comm_stats_logged.add(key)
+
+        group_sizes, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
+        if factor_kind == 'p':
+            max_sizes = self._compressed_group_sizes_p
+            max_padded_sizes = [buf.numel() for buf in self._compressed_pad_buffers_p]
+        else:
+            max_sizes = self._compressed_group_sizes_q
+            max_padded_sizes = [buf.numel() for buf in self._compressed_pad_buffers_q]
+
+        if self._active_prefix_enabled:
+            logical_sizes = group_sizes
+        else:
+            _, _, logical_p_sizes, logical_q_sizes = self._compute_step_compression_layout(step)
+            logical_sizes = logical_p_sizes if factor_kind == 'p' else logical_q_sizes
+
+        logical_numel = int(sum(logical_sizes))
+        communicated_numel = int(sum(group_sizes))
+        padded_communicated_numel = int(sum(padded_sizes))
+        max_numel = int(sum(max_sizes))
+        max_padded_numel = int(sum(max_padded_sizes))
+        current_rank = self._current_rank_for_stats(step)
+        with open(self._comm_stats_output_path, 'a') as f:
+            f.write(
+                '%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n'
+                % (
+                    int(step),
+                    factor_kind,
+                    1 if self._active_prefix_enabled else 0,
+                    int(self._num_groups),
+                    logical_numel,
+                    communicated_numel,
+                    padded_communicated_numel,
+                    max_numel,
+                    max_padded_numel,
+                    logical_numel * 4,
+                    communicated_numel * 4,
+                    padded_communicated_numel * 4,
+                    max_numel * 4,
+                    max_padded_numel * 4,
+                    str(current_rank),
+                )
+            )
 
     def _is_refresh_step(self):
         if not self._compression or self._refresh_k <= 0:
@@ -1932,6 +2028,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._prepare_active_compression_layout(
                 self._num_steps, self._active_compression_factor
             )
+            self._log_comm_stats(self._num_steps, self._active_compression_factor)
             self._active_update_norm_group_sums = {}
             if hasattr(self._compression, 'begin_global_update_norm_observation'):
                 self._compression.begin_global_update_norm_observation(

@@ -51,6 +51,7 @@ parser.add_argument("--download-dataset", action="store_true", default=False)
 parser.add_argument("--print-freq", type=int, default=50)
 parser.add_argument("--convergence-log-every", type=int, default=0)
 parser.add_argument("--convergence-output", type=str, default="")
+parser.add_argument("--comm-stats-output", type=str, default="")
 parser.add_argument("--fp16", action="store_true", default=False)
 parser.add_argument("--no-cuda", action="store_true", default=False)
 parser.add_argument("--use-adasum", action="store_true", default=False)
@@ -109,6 +110,7 @@ os.environ["DEAR_OVERLAP_WARMUP"] = str(args.overlap_warmup)
 os.environ["DEAR_OVERLAP_OUTPUT"] = args.overlap_output
 os.environ["DEAR_OVERLAP_TIMELINE_OUTPUT"] = args.overlap_timeline_output
 os.environ["DEAR_OVERLAP_CONSOLE"] = str(args.overlap_console)
+os.environ["DEAR_COMM_STATS_OUTPUT"] = args.comm_stats_output
 if args.convergence_output and hvd.rank() == 0:
     convergence_dir = os.path.dirname(args.convergence_output)
     if convergence_dir:

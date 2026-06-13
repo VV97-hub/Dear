@@ -95,6 +95,8 @@ parser.add_argument('--loss-log-every', type=int, default=0,
                     help='print and record training loss every N steps; 0 disables loss.item() logging')
 parser.add_argument('--convergence-output', type=str, default='',
                     help='optional rank-0 CSV path for step, elapsed time, loss, lr, and samples')
+parser.add_argument('--comm-stats-output', type=str, default='',
+                    help='optional rank-0 CSV path for per-step compressed communication volume')
 # 动态rank增加：
 parser.add_argument('--compress-rank', type=int, default=16)
 parser.add_argument('--compress-rank-overrides', type=str, default='',
@@ -147,6 +149,7 @@ os.environ['DEAR_OVERLAP_WARMUP'] = str(args.overlap_warmup)
 os.environ['DEAR_OVERLAP_OUTPUT'] = args.overlap_output
 os.environ['DEAR_OVERLAP_TIMELINE_OUTPUT'] = args.overlap_timeline_output
 os.environ['DEAR_OVERLAP_CONSOLE'] = str(args.overlap_console)
+os.environ['DEAR_COMM_STATS_OUTPUT'] = args.comm_stats_output
 if args.convergence_output and hvd.rank() == 0:
     convergence_dir = os.path.dirname(args.convergence_output)
     if convergence_dir:

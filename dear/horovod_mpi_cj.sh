@@ -28,6 +28,7 @@ num_iters="${num_iters:-}"
 loss_log_every="${loss_log_every:-0}"
 convergence_log_every="${convergence_log_every:-0}"
 convergence_output="${convergence_output:-}"
+comm_stats_output="${comm_stats_output:-}"
 epochs="${epochs:-}"
 print_freq="${print_freq:-}"
 dear_event_sync="${dear_event_sync:-${DEAR_EVENT_SYNC:-1}}"
@@ -187,6 +188,9 @@ append_benchmark_args() {
     if [ -n "$convergence_output" ]; then
         current="$current --convergence-output $convergence_output"
     fi
+    if [ -n "$comm_stats_output" ]; then
+        current="$current --comm-stats-output $comm_stats_output"
+    fi
     echo "$current"
 }
 
@@ -203,6 +207,9 @@ append_cifar_args() {
     fi
     if [ -n "$convergence_output" ]; then
         current="$current --convergence-output $convergence_output"
+    fi
+    if [ -n "$comm_stats_output" ]; then
+        current="$current --comm-stats-output $comm_stats_output"
     fi
     echo "$current"
 }
