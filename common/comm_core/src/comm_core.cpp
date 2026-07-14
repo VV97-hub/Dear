@@ -35,6 +35,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("syncEvent", &Communicator::syncEvent)
         .def("queryEvent", &Communicator::queryEvent)
         .def("syncEventElapsedFromBase", &Communicator::syncEventElapsedFromBase)
+        .def("syncEventElapsedRangeFromBase", &Communicator::syncEventElapsedRangeFromBase)
         .def("waitCurrentStream", &Communicator::waitCurrentStream)
         .def("waitEvent", &Communicator::waitEvent)
         .def("waitEventOnCurrentStream", &Communicator::waitEventOnCurrentStream)

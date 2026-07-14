@@ -77,6 +77,7 @@ public:
     void syncEvent(int handler);
     bool queryEvent(int handler);
     float syncEventElapsedFromBase(int handler);
+    std::vector<float> syncEventElapsedRangeFromBase(int handler);
     void waitCurrentStream();
     void waitEvent(Communicator &producer, int handler);
     void waitEventOnCurrentStream(int handler);
@@ -94,6 +95,7 @@ private:
     cudaStream_t* m_streams;
     std::vector<at::cuda::CUDAStream> m_torchstreams;
     std::vector<cudaEvent_t> m_op_events;
+    std::vector<cudaEvent_t> m_op_start_events;
     cudaEvent_t m_op_base_event;
     bool m_op_base_event_recorded;
     cudaEvent_t *m_events;
