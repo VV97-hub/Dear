@@ -984,6 +984,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._active_compressed_padded_group_sizes_q = [
                 buf.numel() for buf in self._compressed_pad_buffers_q
             ]
+            self._active_compression_layout_key = None
+            self._active_compression_layout_cache = {}
 
         self._overlap_profiler.set_topology(topology_module_groups, group_stats=group_stats)
         self._refresh_first_handles = [None] * self._num_groups
@@ -1090,11 +1092,36 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             ]
             self._active_compression_layout_step = step
             self._active_compression_layout_factor = factor_kind
+            self._active_compression_layout_key = ('max',)
             return
+
+        if hasattr(self._compression, 'layout_cache_key'):
+            layout_key = self._compression.layout_cache_key(step)
+        else:
+            layout_key = ('step', int(step))
+
         if (
-            self._active_compression_layout_step == step
-            and self._active_compression_layout_factor == factor_kind
+            getattr(self, '_active_compression_layout_key', None) == layout_key
         ):
+            return
+
+        layout_cache = getattr(self, '_active_compression_layout_cache', None)
+        if layout_cache is None:
+            layout_cache = {}
+            self._active_compression_layout_cache = layout_cache
+        cached_layout = layout_cache.get(layout_key)
+        if cached_layout is not None:
+            (
+                self._active_compressed_param_offsets_p,
+                self._active_compressed_param_offsets_q,
+                self._active_compressed_group_sizes_p,
+                self._active_compressed_group_sizes_q,
+                self._active_compressed_padded_group_sizes_p,
+                self._active_compressed_padded_group_sizes_q,
+            ) = cached_layout
+            self._active_compression_layout_step = step
+            self._active_compression_layout_factor = factor_kind
+            self._active_compression_layout_key = layout_key
             return
 
         active_offsets_p, active_offsets_q, group_sizes_p, group_sizes_q = (
@@ -1126,8 +1153,17 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._active_compressed_padded_group_sizes_q = _padded_sizes(
             group_sizes_q, self._compressed_pad_buffers_q
         )
+        layout_cache[layout_key] = (
+            self._active_compressed_param_offsets_p,
+            self._active_compressed_param_offsets_q,
+            self._active_compressed_group_sizes_p,
+            self._active_compressed_group_sizes_q,
+            self._active_compressed_padded_group_sizes_p,
+            self._active_compressed_padded_group_sizes_q,
+        )
         self._active_compression_layout_step = step
         self._active_compression_layout_factor = factor_kind
+        self._active_compression_layout_key = layout_key
 
     def _compression_group_buffer_views_for_factor(self, factor_kind, group_idx):
         pad_buffers, shard_buffers = self._compression_buffers_for_factor(factor_kind)

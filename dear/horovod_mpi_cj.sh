@@ -1,7 +1,8 @@
 #!/bin/bash
 nworkers="${nworkers:-4}"
 bs="${bs:-64}"
-# dnn参数选择模型和数据：cifar10_resnet18/cifar10_vgg16/cifar100_resnet18/cifar100_vgg16 （真实 CIFAR 训练任务——ACP测试精度的） 
+# dnn参数选择模型和数据：cifar10_resnet18/cifar10_resnet34/cifar10_vgg16/cifar100_resnet18/cifar100_resnet34/cifar100_vgg16 （真实 CIFAR 训练任务——ACP测试精度的）
+# GPT扩展实验：gpt_125m/gpt_160m/gpt_230m
 # 原本的实验 bert_base /bert ————> 对应bert_benchmark  dnn=resnet18、dnn=vgg16 走的是 /mnt/c/Users/sg564/Desktop/Dear/dear/imagenet_benchmark.py:1，那是合成数据吞吐测试
 dnn="${dnn:-bert_base}"
 if [ -z "${data_dir+x}" ]; then # 只有当没有手动设置 data_dir 时，脚本才自动选择数据目录
@@ -19,6 +20,7 @@ compress_refresh_k="${compress_refresh_k:-}"
 compress_min_numel="${compress_min_numel:-}"
 rank_schedule="${rank_schedule:-}"
 stable_rank_levels="${stable_rank_levels:-}"
+update_norm_debug_every="${update_norm_debug_every:-}"
 rank_reset_on_change="${rank_reset_on_change:-0}"
 active_prefix_enabled="${active_prefix_enabled:-1}"
 embedding_policy="${embedding_policy:-word}"
@@ -32,6 +34,17 @@ comm_stats_output="${comm_stats_output:-}"
 comm_stats_every="${comm_stats_every:-1}"
 epochs="${epochs:-}"
 print_freq="${print_freq:-}"
+base_lr="${base_lr:-}"
+warmup_epochs="${warmup_epochs:-}"
+lr_decay_epochs="${lr_decay_epochs:-}"
+lr_decay_factor="${lr_decay_factor:-}"
+cifar_workers="${cifar_workers:-}"
+seed="${seed:-}"
+gpt_data_file="${gpt_data_file:-./wikitext-local/train-00000-of-00001.parquet}"
+gpt_tokenizer_dir="${gpt_tokenizer_dir:-./bert-base-uncased-local}"
+max_train_tokens="${max_train_tokens:-}"
+learning_rate="${learning_rate:-}"
+weight_decay="${weight_decay:-}"
 dear_event_sync="${dear_event_sync:-${DEAR_EVENT_SYNC:-1}}"
 senlen="${senlen:-64}"
 rdma="${rdma:-0}"
@@ -58,9 +71,9 @@ source ../configs/envs.conf
 echo "获取节点主机名"
 scontrol show hostnames
 GPUS=`nvidia-smi -L | wc -l`
-HOSTFILE=../configs/cluster$SLURM_NNODES
-rm $HOSTFILE
-touch $HOSTFILE
+HOSTFILE=../configs/cluster${SLURM_NNODES}_${SLURM_JOB_ID:-$$}
+rm -f "$HOSTFILE"
+touch "$HOSTFILE"
 for nodename in `scontrol show hostnames`
 do
     echo "${nodename} slots=${GPUS}"
@@ -165,6 +178,9 @@ append_acpr_args() {
     if [ -n "$stable_rank_levels" ]; then
         current="$current --stable-rank-levels $stable_rank_levels"
     fi
+    if [ -n "$update_norm_debug_every" ]; then
+        current="$current --update-norm-debug-every $update_norm_debug_every"
+    fi
     if [ "$rank_reset_on_change" = "1" ]; then
         current="$current --rank-reset-on-change"
     fi
@@ -201,11 +217,65 @@ append_cifar_args() {
     if [ -n "$epochs" ]; then
         current="$current --epochs $epochs"
     fi
+    if [ -n "$base_lr" ]; then
+        current="$current --base-lr $base_lr"
+    fi
+    if [ -n "$warmup_epochs" ]; then
+        current="$current --warmup-epochs $warmup_epochs"
+    fi
+    if [ -n "$lr_decay_epochs" ]; then
+        current="$current --lr-decay-epochs $lr_decay_epochs"
+    fi
+    if [ -n "$lr_decay_factor" ]; then
+        current="$current --lr-decay-factor $lr_decay_factor"
+    fi
+    if [ -n "$cifar_workers" ]; then
+        current="$current --workers $cifar_workers"
+    fi
+    if [ -n "$seed" ]; then
+        current="$current --seed $seed"
+    fi
     if [ -n "$print_freq" ]; then
         current="$current --print-freq $print_freq"
     fi
     if [ "$convergence_log_every" != "0" ]; then
         current="$current --convergence-log-every $convergence_log_every"
+    fi
+    if [ -n "$convergence_output" ]; then
+        current="$current --convergence-output $convergence_output"
+    fi
+    if [ -n "$comm_stats_output" ]; then
+        current="$current --comm-stats-output $comm_stats_output"
+        current="$current --comm-stats-every $comm_stats_every"
+    fi
+    echo "$current"
+}
+
+append_gpt_args() {
+    local current="$1"
+    if [ -n "$num_warmup_batches" ]; then
+        current="$current --num-warmup-batches $num_warmup_batches"
+    fi
+    if [ -n "$num_batches_per_iter" ]; then
+        current="$current --num-batches-per-iter $num_batches_per_iter"
+    fi
+    if [ -n "$num_iters" ]; then
+        current="$current --num-iters $num_iters"
+    fi
+    if [ -n "$learning_rate" ]; then
+        current="$current --learning-rate $learning_rate"
+    fi
+    if [ -n "$weight_decay" ]; then
+        current="$current --weight-decay $weight_decay"
+    fi
+    if [ -n "$max_train_tokens" ]; then
+        current="$current --max-train-tokens $max_train_tokens"
+    fi
+    if [ -n "$seed" ]; then
+        current="$current --seed $seed"
+    fi
+    if [ "$loss_log_every" != "0" ]; then
+        current="$current --loss-log-every $loss_log_every"
     fi
     if [ -n "$convergence_output" ]; then
         current="$current --convergence-output $convergence_output"
@@ -223,7 +293,7 @@ if [ "$dnn" = "bert" ] || [ "$dnn" = "bert_base" ]; then
     benchfile=$(append_overlap_args "$benchfile")
     benchfile=$(append_acpr_args "$benchfile")
     benchfile=$(append_benchmark_args "$benchfile")
-elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn" = "cifar100_resnet18" ] || [ "$dnn" = "cifar100_vgg16" ]; then
+elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_resnet34" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn" = "cifar100_resnet18" ] || [ "$dnn" = "cifar100_resnet34" ] || [ "$dnn" = "cifar100_vgg16" ]; then
     benchfile="cifar_benchmark.py --model $dnn --exclude-parts $exclude_parts --data-dir $data_dir"
     if [ "$download_dataset" = "1" ]; then
         benchfile="$benchfile --download-dataset"
@@ -231,6 +301,11 @@ elif [ "$dnn" = "cifar10_resnet18" ] || [ "$dnn" = "cifar10_vgg16" ] || [ "$dnn"
     benchfile=$(append_overlap_args "$benchfile")
     benchfile=$(append_acpr_args "$benchfile")
     benchfile=$(append_cifar_args "$benchfile")
+elif [ "$dnn" = "gpt_125m" ] || [ "$dnn" = "gpt_160m" ] || [ "$dnn" = "gpt_230m" ]; then
+    benchfile="gpt_benchmark.py --model $dnn --seq-len $senlen --exclude-parts $exclude_parts --data-file $gpt_data_file --tokenizer-dir $gpt_tokenizer_dir"
+    benchfile=$(append_overlap_args "$benchfile")
+    benchfile=$(append_acpr_args "$benchfile")
+    benchfile=$(append_gpt_args "$benchfile")
 else
     benchfile="imagenet_benchmark.py --model $dnn --exclude-parts $exclude_parts"
 fi
@@ -267,7 +342,7 @@ echo $cmd
 # -x NCCL_SOCKET_IFNAME=${ETH_INTERFACE} \ 改成了bond0，${ETH_INTERFACE}是setup_env里面配置的变量，使用bond0进行通信。
 # -hostfile ../configs/cluster$nworkers 改成了-H node1,node2,node3,node4 （第一行参数）取消用hostfile控制节点。因为localhost可以用，但gpu1、gpu2这些看不到
 if [ "$rdma" = "0" ]; then
-$MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile ../configs/cluster$nworkers -bind-to none --map-by slot\
+$MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile "$HOSTFILE" -bind-to none --map-by slot\
     -mca btl_tcp_if_include ${ETH_MPI_BTC_TCP_IF_INCLUDE} \
     -x NCCL_DEBUG=VERSION  \
     -x NCCL_SOCKET_IFNAME=${ETH_INTERFACE} \
@@ -281,7 +356,7 @@ elif [ "$rdma" = "1" ]; then
 # -x NCCL_DEBUG=VERSION \ 改成了 -x NCCL_DEBUG=INFO \ 
 # 如果以后需要启用: -mca btl_tcp_if_include ${IB_INTERFACE}
 cmd="$cmd --rdma"
-$MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile ../configs/cluster$nworkers -bind-to none --map-by slot\
+$MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile "$HOSTFILE" -bind-to none --map-by slot\
     --mca pml ob1 --mca btl openib,vader,self --mca btl_openib_allow_ib 1 \
     --mca btl_openib_want_fork_support 1 \
     -x LD_LIBRARY_PATH  \
@@ -296,7 +371,7 @@ else
 #100GbIB Config with Ethernet
 # -x NCCL_DEBUG=VERSION \ 改成了 -x NCCL_DEBUG=INFO \ 
 cmd="$cmd --rdma"
-$MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile ../configs/cluster$nworkers -bind-to none --map-by slot\
+$MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile "$HOSTFILE" -bind-to none --map-by slot\
     --mca pml ob1 --mca btl openib,vader,self --mca btl_openib_allow_ib 1 \
     -mca btl_tcp_if_include ${IB_INTERFACE} \
     --mca btl_openib_want_fork_support 1 \

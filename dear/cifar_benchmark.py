@@ -16,7 +16,7 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
 import dopt_rsag as hvd
-from cifar_models import cifar_resnet18, cifar_vgg16
+from cifar_models import cifar_resnet18, cifar_resnet34, cifar_vgg16
 from compression import compressors
 
 
@@ -27,14 +27,21 @@ os.environ["HOROVOD_CACHE_CAPACITY"] = "0"
 os.environ["HOROVOD_CYCLE_TIME"] = "0"
 
 parser = argparse.ArgumentParser(
-    description="CIFAR-10/100 benchmark with VGG-16 and ResNet-18",
+    description="CIFAR-10/100 benchmark with ResNet-18/34 and VGG-16",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument(
     "--model",
     type=str,
     default="cifar10_resnet18",
-    choices=["cifar10_resnet18", "cifar10_vgg16", "cifar100_resnet18", "cifar100_vgg16"],
+    choices=[
+        "cifar10_resnet18",
+        "cifar10_resnet34",
+        "cifar10_vgg16",
+        "cifar100_resnet18",
+        "cifar100_resnet34",
+        "cifar100_vgg16",
+    ],
 )
 parser.add_argument("--batch-size", type=int, default=128)
 parser.add_argument("--epochs", type=int, default=300)
@@ -76,6 +83,12 @@ parser.add_argument("--overlap-timeline-output", type=str, default="")
 parser.add_argument("--overlap-console", type=int, default=1)
 parser.add_argument("--compress-rank", type=int, default=8)
 parser.add_argument("--compress-warmup", type=int, default=1000)
+parser.add_argument(
+    "--compress-refresh-k",
+    type=int,
+    default=0,
+    help="every K compressed steps run a two-factor refresh; 0 disables",
+)
 parser.add_argument("--compress-min-numel", type=int, default=16384)
 parser.add_argument("--rank-reset-on-change", action="store_true", default=False)
 parser.add_argument("--active-prefix-enabled", type=int, default=1, choices=[0, 1])
@@ -185,6 +198,8 @@ def hvd_barrier():
 def build_model():
     if args.model.endswith("_resnet18"):
         return cifar_resnet18(num_classes=dataset_config["num_classes"])
+    if args.model.endswith("_resnet34"):
+        return cifar_resnet34(num_classes=dataset_config["num_classes"])
     return cifar_vgg16(num_classes=dataset_config["num_classes"])
 
 
@@ -350,6 +365,7 @@ if hvd.size() > 1:
         mgwfbp=args.mgwfbp,
         rdma=args.rdma,
         exclude_parts=args.exclude_parts,
+        refresh_k=args.compress_refresh_k,
         active_prefix_enabled=bool(args.active_prefix_enabled),
     )
     hvd.broadcast_parameters(model.state_dict(), root_rank=0)

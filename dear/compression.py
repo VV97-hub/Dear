@@ -78,6 +78,15 @@ class HalfRankKReducer(Reducer):
 
         # 动态rank调度器，None表示退化为固定rank
         self.rank_schedule = rank_schedule
+        self._rank_schedule_items = None
+        self._rank_schedule_cache = {}
+        self._rank_schedule_max_rank = self.default_rank
+        if isinstance(rank_schedule, dict):
+            self._rank_schedule_items = sorted(
+                (int(step), int(value)) for step, value in rank_schedule.items()
+            )
+            if self._rank_schedule_items:
+                self._rank_schedule_max_rank = max(value for _, value in self._rank_schedule_items)
 
         self.rank_overrides = {}
         if rank_overrides:
@@ -111,6 +120,7 @@ class HalfRankKReducer(Reducer):
         self._global_update_norm_observation = None
         self._debug_print_pq_shapes = os.environ.get('DEAR_PRINT_PQ_SHAPES', '0') == '1' # 输出P和Q的维度大小
         self._debug_printed_pq_shapes = set()
+        self._rank_change_debug = os.environ.get('DEAR_RANK_CHANGE_DEBUG', '0') == '1'
         self.rank_reset_on_change = bool(rank_reset_on_change)
         self.embedding_policy = str(
             os.environ.get('DEAR_EMBEDDING_POLICY', embedding_policy)
@@ -208,11 +218,28 @@ class HalfRankKReducer(Reducer):
             # 函数式调度：完全由外部逻辑控制
             return self.rank_schedule(step)
 
-        # dict调度：找到所有不超过当前step的阈值中最大的那个
-        applicable = {s: r for s, r in self.rank_schedule.items() if s <= step}
-        if applicable:
-            return applicable[max(applicable)]
-        return self.default_rank
+        # dict调度：预排序后线性扫描少量阈值，并缓存同一step的结果。
+        # aggressive/gentle这类schedule在一个step内会被多个tensor反复查询。
+        step = int(step)
+        cached = self._rank_schedule_cache.get(step)
+        if cached is not None:
+            return cached
+        base_rank = self.default_rank
+        schedule_items = self._rank_schedule_items
+        if schedule_items is None:
+            schedule_items = sorted(
+                (int(s), int(r)) for s, r in self.rank_schedule.items()
+            )
+            self._rank_schedule_items = schedule_items
+            if schedule_items:
+                self._rank_schedule_max_rank = max(r for _, r in schedule_items)
+        for threshold, rank_value in schedule_items:
+            if threshold <= step:
+                base_rank = rank_value
+            else:
+                break
+        self._rank_schedule_cache[step] = base_rank
+        return base_rank
 
     def _stable_base_rank(self, step, n, m, name=None, shape=None):
         if name is not None and name.lower() in self.rank_overrides:
@@ -275,7 +302,7 @@ class HalfRankKReducer(Reducer):
             worker_rank = torch.distributed.get_rank()
         except Exception:
             worker_rank = 0
-        if old_rank != new_rank and worker_rank == 0:
+        if self._rank_change_debug and old_rank != new_rank and worker_rank == 0:
             label = name if name is not None else key[0]
             print(
                 "[DynamicRank] step=%s name=%s rank=%s -> %s"
@@ -316,7 +343,7 @@ class HalfRankKReducer(Reducer):
         # TODO 这里逻辑有问题，为什么不按照轮次来选择：
         else:
             # dict 调度：取所有阶段 rank 的最大值，保证 buffer 足够大
-            base_rank = max(self.rank_schedule.values())
+            base_rank = self._rank_schedule_max_rank
 
         if self.rank_overrides:
             return max(base_rank, max(self.rank_overrides.values()))
@@ -327,10 +354,33 @@ class HalfRankKReducer(Reducer):
             return self.rank_overrides[name.lower()]
         if self.rank_schedule is None or callable(self.rank_schedule):
             return self.default_rank
-        return max(self.rank_schedule.values())
+        return self._rank_schedule_max_rank
+
+    def layout_cache_key(self, step):
+        """
+        Return a compact key for active-prefix layout reuse.
+        The communication layout depends on the effective global rank level, not
+        on the absolute step number.  For staged schedules this avoids rebuilding
+        identical offsets on every compressed step.
+        """
+        if self.update_norm_stable_rank:
+            # Apply pending level changes consistently with _get_rank().
+            self._stable_base_rank(step, 1, 1)
+            return ('stable', int(self.global_rank_level_idx))
+        if self.rank_schedule is None:
+            return ('fixed', int(self.default_rank))
+        if callable(self.rank_schedule):
+            # Keep callable schedules conservative; arbitrary callables may not
+            # be pure functions of rank level.
+            return ('callable', int(step))
+        return ('scheduled', int(self._scheduled_base_rank(step)))
 
     def wants_update_norm_observation(self):
-        return self.update_norm_stable_rank
+        if not self.update_norm_stable_rank:
+            return False
+        if self.pending_global_rank_level is not None:
+            return True
+        return self.global_rank_level_idx < len(self.stable_rank_levels) - 1
 
     def begin_global_update_norm_observation(self, step, num_groups):
         """
@@ -417,7 +467,7 @@ class HalfRankKReducer(Reducer):
             worker_rank = torch.distributed.get_rank()
         except Exception:
             worker_rank = 0
-        if worker_rank == 0:
+        if self._rank_change_debug and worker_rank == 0:
             print(
                 "[StableUpdateNormRank] step=%s global_rank=%s -> %s pending_from_step=%s stable_count=%s raw_change=%.6f ema_change=%.6f"
                 % (obs['step'], old_rank, new_rank, apply_step, stable_count, raw_change, ema_change),

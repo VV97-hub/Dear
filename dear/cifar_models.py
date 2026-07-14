@@ -154,5 +154,9 @@ def cifar_resnet18(num_classes=10):
     return CIFARResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
 
 
+def cifar_resnet34(num_classes=10):
+    return CIFARResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes)
+
+
 def cifar_vgg16(num_classes=10):
     return CIFARVGG(num_classes=num_classes)
