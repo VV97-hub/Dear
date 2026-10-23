@@ -1,0 +1,202 @@
+[
+  {
+    "configuration": "Dense communication",
+    "nodes": 2,
+    "raw_mean": 34.825,
+    "target_mean": 34.83,
+    "difference": 0.0049999999999954525,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N2_P0_dense_1162183.out",
+    "sha256": "7a3a4666dd4a23b962ff3f6af85e813ed4455df5178539df78cbae9b6b42e5bf"
+  },
+  {
+    "configuration": "Dense communication",
+    "nodes": 4,
+    "raw_mean": 24.547,
+    "target_mean": 24.55,
+    "difference": 0.0030000000000001137,
+    "matched": true,
+    "path": "dear/logs/acpr_gpt_20260707_8pool/perf/GPTP0_gpt230m_dense_1145789.out",
+    "sha256": "aaf9c86467631e676888fa42f4ff11b3c028a798b28a8415897d783b4ce483b8"
+  },
+  {
+    "configuration": "Dense communication",
+    "nodes": 6,
+    "raw_mean": 55.1075,
+    "target_mean": 55.11,
+    "difference": 0.0024999999999977263,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N6_P0_dense_1162188.out",
+    "sha256": "be088140da828d0971165bab8bcfabcd83f2ce616103dcf5c4b460aea07a666d"
+  },
+  {
+    "configuration": "Dense communication",
+    "nodes": 8,
+    "raw_mean": 55.64416666666666,
+    "target_mean": 55.64,
+    "difference": 0.004166666666662877,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N8_P0_dense_1162193.out",
+    "sha256": "3e53af0e8dc0a00dc1dfe001d23bb0f6d17069d6d0972b7e276a36dbad5c6f49"
+  },
+  {
+    "configuration": "Full-factor PowerSGD",
+    "nodes": 2,
+    "raw_mean": 69.83283333333333,
+    "target_mean": 69.83,
+    "difference": 0.0028333333333279143,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N2_P8_fullpq_1162184.out",
+    "sha256": "d3a522ddfb6842a151270e1a41f484adafe2565f9653622f026c52d05737ac02"
+  },
+  {
+    "configuration": "Full-factor PowerSGD",
+    "nodes": 4,
+    "raw_mean": 135.5035,
+    "target_mean": 135.5,
+    "difference": 0.003500000000002501,
+    "matched": true,
+    "path": "dear/logs/acpr_gpt_20260707_8pool/perf/GPTP8_gpt230m_fullpq_1145792.out",
+    "sha256": "1f0fc4a95ef7f0355c6263ee9eb5cbe30ddb64a74df18a993ee4a5a538a776f5"
+  },
+  {
+    "configuration": "Full-factor PowerSGD",
+    "nodes": 6,
+    "raw_mean": 200.86133333333333,
+    "target_mean": 200.86,
+    "difference": 0.001333333333320752,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N6_P8_fullpq_1162189.out",
+    "sha256": "a672516ba32c28708a7db6f6617482795e2c1adb621815481c022d782b6c472b"
+  },
+  {
+    "configuration": "Full-factor PowerSGD",
+    "nodes": 8,
+    "raw_mean": 270.45683333333335,
+    "target_mean": 270.46,
+    "difference": 0.0031666666666296805,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N8_P8_fullpq_1162194.out",
+    "sha256": "c2da9f498afef4e4d0f8f21f3f5a875084b906ce407122afbe95e2cfce3e9649"
+  },
+  {
+    "configuration": "CPU-sync handoff",
+    "nodes": 2,
+    "raw_mean": 80.62483333333333,
+    "target_mean": 80.62,
+    "difference": 0.004833333333323253,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N2_P7_cpusync_1162185.out",
+    "sha256": "c09d3e66e2ed75b75d75e238d4c1266dec2e217de00cb174290b5c149b925a02"
+  },
+  {
+    "configuration": "CPU-sync handoff",
+    "nodes": 4,
+    "raw_mean": 148.20266666666666,
+    "target_mean": 148.2,
+    "difference": 0.0026666666666699257,
+    "matched": true,
+    "path": "dear/logs/acpr_gpt_20260707_8pool/perf/GPTP7_gpt230m_cpu_sync_handoff_1145811.out",
+    "sha256": "c96d5492ea039556767916f27c17a956655069622ff19c6dce06769a6e366db4"
+  },
+  {
+    "configuration": "CPU-sync handoff",
+    "nodes": 6,
+    "raw_mean": 236.90583333333333,
+    "target_mean": 236.91,
+    "difference": 0.004166666666662877,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N6_P7_cpusync_1162190.out",
+    "sha256": "5a16fd2e027b66d21be2866d098e34ae79ba5db4bebda462ec7a8a17fa5fc066"
+  },
+  {
+    "configuration": "CPU-sync handoff",
+    "nodes": 8,
+    "raw_mean": 319.24266666666665,
+    "target_mean": 319.24,
+    "difference": 0.002666666666641504,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N8_P7_cpusync_1162195.out",
+    "sha256": "cd7e188ce8d43900f5e8fe3100877db7110a3c27b96670f2fca8bb97e5b20f61"
+  },
+  {
+    "configuration": "No active prefix",
+    "nodes": 2,
+    "raw_mean": 83.3635,
+    "target_mean": 83.36,
+    "difference": 0.003500000000002501,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N2_P3_noap_1162186.out",
+    "sha256": "b46ce5560f111b7c73fbe9f0ab89a7a9ad3e3f308fb5f63e7cf1a7b0a54a86f0"
+  },
+  {
+    "configuration": "No active prefix",
+    "nodes": 4,
+    "raw_mean": 165.50066666666666,
+    "target_mean": 165.5,
+    "difference": 0.000666666666660376,
+    "matched": true,
+    "path": "dear/logs/acpr_gpt_20260707_8pool/perf/GPTP3_gpt230m_no_active_prefix_1145810.out",
+    "sha256": "dbc6c030942d8fca36d44ca51c554e702a139bd43da7c3b9b08ac21d56b43e2b"
+  },
+  {
+    "configuration": "No active prefix",
+    "nodes": 6,
+    "raw_mean": 246.872,
+    "target_mean": 246.87,
+    "difference": 0.0020000000000095497,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N6_P3_noap_1162191.out",
+    "sha256": "1fa412f3dfb2dc36e1f9671f8aee0ded141f9499a013fdf2ebc1a9f8d4ea5cd3"
+  },
+  {
+    "configuration": "No active prefix",
+    "nodes": 8,
+    "raw_mean": 332.04716666666667,
+    "target_mean": 332.05,
+    "difference": 0.002833333333342125,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N8_P3_noap_1162196.out",
+    "sha256": "ef28c1609f85b73dee6f0e657cd0b330326892dd9df613b7af2f940bbb08733f"
+  },
+  {
+    "configuration": "Helix (ours)",
+    "nodes": 2,
+    "raw_mean": 90.63383333333333,
+    "target_mean": 90.63,
+    "difference": 0.003833333333332689,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N2_P9_helix_1162187.out",
+    "sha256": "1b3ea50f8da7be385cf6e4a7ebf9d57f1b011e145c5453bf4acd611ed3d52657"
+  },
+  {
+    "configuration": "Helix (ours)",
+    "nodes": 4,
+    "raw_mean": 171.24966666666666,
+    "target_mean": 171.25,
+    "difference": 0.00033333333334439885,
+    "matched": true,
+    "path": "dear/logs/acpr_gpt_20260707_8pool/perf/GPTP9_gpt230m_acpr_1145791.out",
+    "sha256": "60a744ed8a183ac5b7a74b0173c1c21c5b7deac767e7d9f636386a51e6c74d96"
+  },
+  {
+    "configuration": "Helix (ours)",
+    "nodes": 6,
+    "raw_mean": 270.05333333333334,
+    "target_mean": 270.05,
+    "difference": 0.0033333333333303017,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N6_P9_helix_1162192.out",
+    "sha256": "df1750dde6fbfb7b4def601fa6e5437a9c172c0ae38f1fb918cdad2bd121d64f"
+  },
+  {
+    "configuration": "Helix (ours)",
+    "nodes": 8,
+    "raw_mean": 349.973,
+    "target_mean": 349.97,
+    "difference": 0.002999999999985903,
+    "matched": true,
+    "path": "dear/logs/helix_gpt_scaling_20260714/perf/GPTS1N8_P9_helix_1162197.out",
+    "sha256": "a9260c2000646c6882106b8fe6a27b3e6fd72cb3b625456f7c8fe294e41a38d9"
+  }
+]

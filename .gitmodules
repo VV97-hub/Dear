@@ -1,0 +1,6 @@
+[submodule "horovod"]
+	path = horovod
+	url = https://github.com/horovod/horovod.git
+[submodule "dear/signSGD-with-Majority-Vote"]
+	path = dear/signSGD-with-Majority-Vote
+	url = https://github.com/jiaweizzhao/signSGD-with-Majority-Vote.git

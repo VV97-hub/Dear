@@ -1,0 +1,2326 @@
+"""本备份是一轮传p一轮传q的powersgd的备份2026/4/2，下一步打算试试一轮内同时传p和q的powersgd"""
+# -*- coding: utf-8 -*-"""
+# Copyright 2020 HKBU. All Rights Reserved.
+# Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+import time
+import torch
+import collections
+import numpy as np
+import json
+
+from comm_core import rank, size, Communicator, init as comm_init
+from tensorfusion import CommReduceScatter, CollectiveOp
+import utils
+from compression import compressors
+
+
+comm_init()
+comm = None
+all_gather_comm = None
+reduce_scatter_comm = None
+refresh_first_comm = None
+refresh_second_comm = None
+
+# Please set THRESHOLD=None and NUM_NEARBY_LAYERS=1 to disable tensor fusion for notf experiments. 
+# 上面的参数设置是禁用 notf 实验中的张量融合功能。
+NUM_NEARBY_LAYERS = 4 # default: 4
+THRESHOLD = 25 # default: 25MB
+NSTREAMS = 1
+def init():
+    global comm
+    global all_gather_comm 
+    global reduce_scatter_comm 
+    comm = Communicator(NSTREAMS)
+    reduce_scatter_comm = CommReduceScatter(op=CollectiveOp.REDUCE_SCATTER)
+    all_gather_comm = CommReduceScatter(op=CollectiveOp.ALL_GATHER)
+
+
+def init_refresh_comms():
+    global refresh_first_comm
+    global refresh_second_comm
+    if refresh_first_comm is not None:
+        return
+    refresh_first_comm = Communicator(NSTREAMS)
+    refresh_second_comm = Communicator(NSTREAMS)
+
+
+DEBUG = False
+
+
+class OverlapProfiler(object):
+    def __init__(self, enabled=False, summary_enabled=False, timeline_enabled=False, rank_id=0, log_every=10, warmup_steps=0, output_path='', timeline_output_path='', console_enabled=True):
+        self.enabled = enabled
+        self.summary_enabled = summary_enabled
+        self.timeline_enabled = timeline_enabled
+        self.rank_id = rank_id
+        self.log_every = max(1, int(log_every))
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.output_path = output_path
+        self.timeline_output_path = timeline_output_path
+        self.console_enabled = console_enabled
+        self.group_count = 0
+        self.current = None
+        self.pending = None
+        self.pending_forward = self._new_pending_forward()
+        self.completed = []
+        if self.summary_enabled and self.output_path and self.rank_id == 0:
+            with open(self.output_path, 'w') as f:
+                f.write('')
+        if self.timeline_enabled and self.timeline_output_path and self.rank_id == 0:
+            with open(self.timeline_output_path, 'w') as f:
+                f.write('')
+            with open(self.timeline_output_path + '.meta.json', 'w') as f:
+                json.dump({}, f)
+
+    def _new_group_trace(self, group_idx):
+        return {
+            'group_idx': int(group_idx),
+            'rs_ready_ts': None,
+            'rs_issue_ts': None,
+            'rs_complete_wait_start_ts': None,
+            'rs_complete_ts': None,
+            'rs_complete_cuda_ts': None,
+            'rs_global_release_ts': None,
+            'ag_issue_ts': None,
+            'ag_wait_start_ts': None,
+            'ag_wait_end_ts': None,
+            'update_start_ts': None,
+            'update_end_ts': None,
+            'update_total_s': 0.0,
+            'update_calls': 0,
+            'forward_gate_ts': None,
+            'forward_end_ts': None,
+        }
+
+    def _new_group_traces(self):
+        return {idx: self._new_group_trace(idx) for idx in range(self.group_count)}
+
+    def _ensure_group_trace(self, record, group_idx):
+        if record is None or group_idx is None:
+            return None
+        idx = int(group_idx)
+        traces = record.setdefault('group_traces', {})
+        if idx not in traces:
+            traces[idx] = self._new_group_trace(idx)
+        return traces[idx]
+
+    def _new_pending_forward(self):
+        return {
+            'ag_wait_s': 0.0,
+            'update_s': 0.0,
+            'ag_last_sync_end_ts': None,
+        }
+
+    def _new_record(self, step):
+        return {
+            'step': int(step),
+            'forward_step': None,
+            'forward_total_s': 0.0,
+            'forward_compute_s': 0.0,
+            'backward_total_s': 0.0,
+            'rs_launches': 0,
+            'rs_first_launch_ts': None,
+            'rs_sync_end_ts': None,
+            'rs_tail_wait_s': 0.0,
+            'ag_first_launch_ts': None,
+            'ag_last_sync_end_ts': None,
+            'ag_wait_s': 0.0,
+            'update_s': 0.0,
+            'inter_phase_gap_s': 0.0,
+            'ag_launches': 0,
+            'backward_start_ts': None,
+            'backward_end_ts': None,
+            'step_start_ts': None,
+            'forward_start_ts': None,
+            'forward_end_ts': None,
+            'group_traces': self._new_group_traces(),
+            'events': [],
+        }
+
+    def begin_step(self, step):
+        if not self.enabled:
+            return
+        if self.current is None:
+            self.current = self._new_record(step)
+            self.current['step_start_ts'] = time.perf_counter()
+
+    def _append_event(self, record, event_type, start_ts, end_ts, group_idx=None, module_name=None):
+        if record is None or not self.timeline_enabled:
+            return
+        record['events'].append({
+            'type': event_type,
+            'start_ts': float(start_ts),
+            'end_ts': float(end_ts),
+            'group_idx': None if group_idx is None else int(group_idx),
+            'module_name': module_name,
+        })
+
+    def set_topology(self, module_groups, group_stats=None):
+        if not self.enabled or not self.timeline_enabled or self.rank_id != 0 or not self.timeline_output_path:
+            return
+        self.group_count = len(module_groups)
+        groups = []
+        for idx, group in enumerate(module_groups):
+            item = {'group_idx': idx, 'modules': list(group)}
+            if group_stats is not None and idx < len(group_stats) and group_stats[idx] is not None:
+                item.update(group_stats[idx])
+            groups.append(item)
+        payload = {
+            'num_groups': len(module_groups),
+            'groups': groups,
+        }
+        with open(self.timeline_output_path + '.meta.json', 'w') as f:
+            json.dump(payload, f, indent=2)
+
+    def note_forward_start(self, step):
+        if not self.enabled or self.pending is None:
+            return
+        self.pending['forward_step'] = int(step)
+        self.pending['forward_start_ts'] = time.perf_counter()
+
+    def note_forward_total(self, duration_s=None, step=None):
+        if not self.enabled:
+            return
+        if self.pending is not None:
+            forward_end_ts = time.perf_counter()
+            forward_start_ts = self.pending.get('forward_start_ts')
+            if forward_start_ts is None and duration_s is not None:
+                forward_start_ts = forward_end_ts - float(duration_s)
+            if forward_start_ts is None:
+                forward_start_ts = forward_end_ts
+            duration_s = max(0.0, forward_end_ts - forward_start_ts)
+            pending_ag = self.pending_forward['ag_wait_s']
+            pending_update = self.pending_forward['update_s']
+            if step is not None:
+                self.pending['forward_step'] = int(step)
+            self.pending['forward_total_s'] = float(duration_s)
+            self.pending['forward_compute_s'] = self._forward_compute_s(
+                self.pending, forward_end_ts
+            )
+            self.pending['forward_start_ts'] = forward_start_ts
+            self.pending['forward_end_ts'] = forward_end_ts
+            self.pending['ag_wait_s'] = pending_ag
+            self.pending['update_s'] = pending_update
+            self.pending['inter_phase_gap_s'] = self._inter_phase_gap_s(self.pending)
+            self.pending['ag_last_sync_end_ts'] = self.pending_forward['ag_last_sync_end_ts']
+            self._append_event(
+                self.pending,
+                event_type='forward_total',
+                start_ts=forward_start_ts,
+                end_ts=forward_end_ts,
+            )
+            self._finalize_pending()
+            self.pending_forward = self._new_pending_forward()
+
+    def note_backward_start(self):
+        if not self.enabled or self.current is None:
+            return
+        self.current['backward_start_ts'] = time.perf_counter()
+
+    def note_backward_total(self, duration_s=None):
+        if not self.enabled or self.current is None:
+            return
+        backward_end_ts = time.perf_counter()
+        backward_start_ts = self.current.get('backward_start_ts')
+        if backward_start_ts is None and duration_s is not None:
+            backward_start_ts = backward_end_ts - float(duration_s)
+        if backward_start_ts is None:
+            backward_start_ts = backward_end_ts
+        self.current['backward_total_s'] = max(0.0, backward_end_ts - backward_start_ts)
+        self.current['backward_end_ts'] = backward_end_ts
+        self._append_event(
+            self.current,
+            event_type='backward_total',
+            start_ts=backward_start_ts,
+            end_ts=backward_end_ts,
+        )
+
+    def note_rs_ready(self, group_idx=None):
+        if not self.enabled or self.current is None:
+            return
+        now = time.perf_counter()
+        group_trace = self._ensure_group_trace(self.current, group_idx)
+        if group_trace is not None and group_trace['rs_ready_ts'] is None:
+            group_trace['rs_ready_ts'] = now
+        self._append_event(
+            self.current,
+            event_type='rs_ready',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+        )
+
+    def note_rs_issue(self, group_idx=None):
+        if not self.enabled or self.current is None:
+            return
+        now = time.perf_counter()
+        self.current['rs_launches'] += 1
+        if self.current['rs_first_launch_ts'] is None:
+            self.current['rs_first_launch_ts'] = now
+        group_trace = self._ensure_group_trace(self.current, group_idx)
+        if group_trace is not None and group_trace['rs_issue_ts'] is None:
+            group_trace['rs_issue_ts'] = now
+        self._append_event(
+            self.current,
+            event_type='rs_launch',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+        )
+
+    def note_rs_sync(self, wait_s=None, start_ts=None, end_ts=None):
+        if not self.enabled or self.current is None:
+            return
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            if wait_s is None:
+                start_ts = end_ts
+            else:
+                start_ts = end_ts - float(wait_s)
+        self.current['rs_sync_end_ts'] = end_ts
+        if self.current['backward_end_ts'] is not None:
+            self.current['rs_tail_wait_s'] = max(
+                0.0, end_ts - self.current['backward_end_ts']
+            )
+        self._append_event(
+            self.current,
+            event_type='rs_sync_wait',
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        for group_idx, group_trace in sorted(self.current.get('group_traces', {}).items()):
+            group_trace['rs_global_release_ts'] = end_ts
+
+    def note_rs_complete(self, group_idx=None, start_ts=None, end_ts=None, cuda_elapsed_ms=None):
+        if not self.enabled or self.current is None:
+            return
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            start_ts = end_ts
+        cuda_complete_ts = None
+        if cuda_elapsed_ms is not None and cuda_elapsed_ms >= 0.0:
+            rs_base_ts = self.current.get('rs_first_launch_ts')
+            if rs_base_ts is not None:
+                cuda_complete_ts = rs_base_ts + float(cuda_elapsed_ms) / 1000.0
+        group_trace = self._ensure_group_trace(self.current, group_idx)
+        if group_trace is not None and group_trace['rs_complete_ts'] is None:
+            group_trace['rs_complete_wait_start_ts'] = start_ts
+            group_trace['rs_complete_ts'] = end_ts
+            group_trace['rs_complete_cuda_ts'] = cuda_complete_ts
+        self._append_event(
+            self.current,
+            event_type='rs_complete_wait',
+            start_ts=start_ts,
+            end_ts=end_ts,
+            group_idx=group_idx,
+        )
+
+    def note_ag_wait(self, duration_s=None, group_idx=None, module_name=None, start_ts=None, end_ts=None):
+        if not self.enabled or self.pending is None:
+            return
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            if duration_s is None:
+                start_ts = end_ts
+            else:
+                start_ts = end_ts - float(duration_s)
+        duration_s = max(0.0, end_ts - start_ts)
+        self.pending_forward['ag_wait_s'] += float(duration_s)
+        self.pending_forward['ag_last_sync_end_ts'] = end_ts
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None:
+            group_trace['ag_wait_start_ts'] = start_ts
+            group_trace['ag_wait_end_ts'] = end_ts
+        self._append_event(
+            self.pending,
+            event_type='ag_wait',
+            start_ts=start_ts,
+            end_ts=end_ts,
+            group_idx=group_idx,
+            module_name=module_name,
+        )
+
+    def note_update(self, duration_s=None, end_ts=None, module_name=None, group_idx=None, start_ts=None):
+        if not self.enabled or self.pending is None:
+            return
+        if end_ts is None:
+            end_ts = time.perf_counter()
+        if start_ts is None:
+            if duration_s is None:
+                start_ts = end_ts
+            else:
+                start_ts = end_ts - float(duration_s)
+        duration_s = max(0.0, end_ts - start_ts)
+        self.pending_forward['update_s'] += float(duration_s)
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None:
+            if group_trace['update_start_ts'] is None:
+                group_trace['update_start_ts'] = start_ts
+            group_trace['update_end_ts'] = end_ts
+            group_trace['update_total_s'] += float(duration_s)
+            group_trace['update_calls'] += 1
+        self._append_event(
+            self.pending,
+            event_type='update',
+            start_ts=start_ts,
+            end_ts=end_ts,
+            group_idx=group_idx,
+            module_name=module_name,
+        )
+
+    def note_forward_gate(self, group_idx=None, module_name=None):
+        if not self.enabled or self.pending is None:
+            return
+        now = time.perf_counter()
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None and group_trace['forward_gate_ts'] is None:
+            group_trace['forward_gate_ts'] = now
+        self._append_event(
+            self.pending,
+            event_type='forward_gate',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+            module_name=module_name,
+        )
+
+    def note_forward_end(self, group_idx=None, module_name=None):
+        if not self.enabled or self.pending is None:
+            return
+        now = time.perf_counter()
+        group_trace = self._ensure_group_trace(self.pending, group_idx)
+        if group_trace is not None and group_trace['forward_end_ts'] is None:
+            group_trace['forward_end_ts'] = now
+        self._append_event(
+            self.pending,
+            event_type='forward_end',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+            module_name=module_name,
+        )
+
+    def note_ag_issue(self, group_idx=None):
+        if not self.enabled:
+            return
+        target = self.pending if self.pending is not None else self.current
+        if target is None:
+            return
+        now = time.perf_counter()
+        target['ag_launches'] += 1
+        if target['ag_first_launch_ts'] is None:
+            target['ag_first_launch_ts'] = now
+        group_trace = self._ensure_group_trace(target, group_idx)
+        if group_trace is not None and group_trace['ag_issue_ts'] is None:
+            group_trace['ag_issue_ts'] = now
+        self._append_event(
+            target,
+            event_type='ag_launch',
+            start_ts=now,
+            end_ts=now,
+            group_idx=group_idx,
+        )
+
+    def _group_traces_payload(self, record, cycle_start_ts):
+        payload = []
+        for group_idx, group_trace in sorted(record.get('group_traces', {}).items()):
+            item = dict(group_trace)
+            for field in [
+                'rs_ready_ts',
+                'rs_issue_ts',
+                'rs_complete_wait_start_ts',
+                'rs_complete_ts',
+                'rs_complete_cuda_ts',
+                'rs_global_release_ts',
+                'ag_issue_ts',
+                'ag_wait_start_ts',
+                'ag_wait_end_ts',
+                'update_start_ts',
+                'update_end_ts',
+                'forward_gate_ts',
+                'forward_end_ts',
+            ]:
+                ts = item.get(field)
+                if ts is not None and cycle_start_ts is not None:
+                    item[field.replace('_ts', '_ms')] = (ts - cycle_start_ts) * 1000.0
+            if item.get('rs_issue_ts') is not None and item.get('rs_global_release_ts') is not None:
+                item['rs_issue_to_global_release_s'] = max(
+                    0.0, item['rs_global_release_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_issue_ts') is not None and item.get('rs_complete_ts') is not None:
+                item['rs_issue_to_complete_s'] = max(
+                    0.0, item['rs_complete_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_issue_ts') is not None and item.get('rs_complete_cuda_ts') is not None:
+                item['rs_issue_to_complete_cuda_s'] = max(
+                    0.0, item['rs_complete_cuda_ts'] - item['rs_issue_ts']
+                )
+            if item.get('rs_complete_wait_start_ts') is not None and item.get('rs_complete_ts') is not None:
+                item['rs_completion_wait_s'] = max(
+                    0.0, item['rs_complete_ts'] - item['rs_complete_wait_start_ts']
+                )
+            if item.get('ag_issue_ts') is not None and item.get('ag_wait_end_ts') is not None:
+                item['ag_issue_to_wait_end_s'] = max(
+                    0.0, item['ag_wait_end_ts'] - item['ag_issue_ts']
+                )
+            if item.get('ag_wait_start_ts') is not None and item.get('ag_wait_end_ts') is not None:
+                item['ag_wait_s'] = max(
+                    0.0, item['ag_wait_end_ts'] - item['ag_wait_start_ts']
+                )
+            if item.get('update_start_ts') is not None and item.get('update_end_ts') is not None:
+                item['update_span_s'] = max(
+                    0.0, item['update_end_ts'] - item['update_start_ts']
+                )
+            if item.get('ag_wait_end_ts') is not None and item.get('forward_gate_ts') is not None:
+                item['resume_to_forward_gate_s'] = max(
+                    0.0, item['forward_gate_ts'] - item['ag_wait_end_ts']
+                )
+            if item.get('forward_gate_ts') is not None and item.get('forward_end_ts') is not None:
+                item['forward_gate_to_end_s'] = max(
+                    0.0, item['forward_end_ts'] - item['forward_gate_ts']
+                )
+            payload.append(item)
+        return payload
+
+    def _first_forward_gate_ts(self, record):
+        first_gate_ts = None
+        for group_trace in record.get('group_traces', {}).values():
+            gate_ts = group_trace.get('forward_gate_ts')
+            if gate_ts is not None and (first_gate_ts is None or gate_ts < first_gate_ts):
+                first_gate_ts = gate_ts
+        return first_gate_ts
+
+    def _inter_phase_gap_s(self, record):
+        backward_end_ts = record.get('backward_end_ts')
+        first_gate_ts = self._first_forward_gate_ts(record)
+        if backward_end_ts is None or first_gate_ts is None:
+            return 0.0
+        return max(0.0, first_gate_ts - backward_end_ts)
+
+    def _forward_compute_s(self, record, forward_end_ts=None):
+        first_gate_ts = self._first_forward_gate_ts(record)
+        if forward_end_ts is None:
+            forward_end_ts = record.get('forward_end_ts')
+        if first_gate_ts is None or forward_end_ts is None:
+            return record.get('forward_total_s', 0.0)
+        return max(0.0, forward_end_ts - first_gate_ts)
+
+    def mark_step_pending(self):
+        if not self.enabled or self.current is None:
+            return
+        self.pending = self.current
+        self.current = None
+        self.pending_forward = self._new_pending_forward()
+
+    def _emit_record(self, record):
+        if self.rank_id != 0:
+            return
+        if self.summary_enabled and self.output_path:
+            ordered_keys = [
+                'step', 'forward_step', 'forward_total_s', 'forward_compute_s',
+                'backward_total_s', 'rs_tail_wait_s',
+                'ag_wait_s', 'update_s', 'inter_phase_gap_s',
+                'rs_launches', 'ag_launches'
+            ]
+            payload = ','.join(
+                ['%s=%s' % (k, record[k]) for k in ordered_keys]
+            )
+            with open(self.output_path, 'a') as f:
+                f.write(payload + '\n')
+        if self.timeline_enabled and self.timeline_output_path:
+            backward_phase_start_ts = record.get('backward_start_ts')
+            backward_phase_end_ts = record.get('backward_end_ts')
+            forward_phase_start_ts = record.get('forward_start_ts')
+            forward_phase_end_ts = record.get('forward_end_ts')
+            rs_phase_start_ts = record.get('rs_first_launch_ts')
+            rs_phase_end_ts = record.get('rs_sync_end_ts')
+            ag_phase_start_ts = record.get('ag_first_launch_ts')
+            ag_phase_end_ts = record.get('ag_last_sync_end_ts')
+
+            cycle_start_ts = backward_phase_start_ts
+            cycle_end_ts = forward_phase_end_ts
+            if cycle_start_ts is None:
+                cycle_start_ts = rs_phase_start_ts
+            if cycle_end_ts is None:
+                cycle_end_ts = ag_phase_end_ts
+            if cycle_end_ts is None:
+                cycle_end_ts = rs_phase_end_ts
+
+            events = []
+            for event in record.get('events', []):
+                item = dict(event)
+                if cycle_start_ts is not None:
+                    item['start_ms'] = (item['start_ts'] - cycle_start_ts) * 1000.0
+                    item['end_ms'] = (item['end_ts'] - cycle_start_ts) * 1000.0
+                if rs_phase_start_ts is not None:
+                    item['start_ms_from_rs'] = (item['start_ts'] - rs_phase_start_ts) * 1000.0
+                    item['end_ms_from_rs'] = (item['end_ts'] - rs_phase_start_ts) * 1000.0
+                if ag_phase_start_ts is not None:
+                    item['start_ms_from_ag'] = (item['start_ts'] - ag_phase_start_ts) * 1000.0
+                    item['end_ms_from_ag'] = (item['end_ts'] - ag_phase_start_ts) * 1000.0
+                events.append(item)
+            timeline_payload = {
+                'cycle': int(record['step']),
+                'source_step': int(record['step']),
+                'forward_step': None if record.get('forward_step') is None else int(record['forward_step']),
+                'cycle_start_ts': cycle_start_ts,
+                'cycle_end_ts': cycle_end_ts,
+                'backward_phase': {
+                    'start_ts': backward_phase_start_ts,
+                    'end_ts': backward_phase_end_ts,
+                    'total_s': record['backward_total_s'],
+                },
+                'forward_phase': {
+                    'start_ts': forward_phase_start_ts,
+                    'end_ts': forward_phase_end_ts,
+                    'total_s': record['forward_total_s'],
+                },
+                'rs_phase': {
+                    'start_ts': rs_phase_start_ts,
+                    'end_ts': rs_phase_end_ts,
+                    'tail_wait_s': record['rs_tail_wait_s'],
+                    'launches': record['rs_launches'],
+                },
+                'ag_phase': {
+                    'start_ts': ag_phase_start_ts,
+                    'end_ts': ag_phase_end_ts,
+                    'wait_s': record['ag_wait_s'],
+                    'update_s': record['update_s'],
+                    'launches': record['ag_launches'],
+                },
+                'summary': {
+                    'forward_total_s': record['forward_total_s'],
+                    'forward_compute_s': record.get('forward_compute_s', record['forward_total_s']),
+                    'backward_total_s': record['backward_total_s'],
+                    'rs_tail_wait_s': record['rs_tail_wait_s'],
+                    'ag_wait_s': record['ag_wait_s'],
+                    'update_s': record['update_s'],
+                    'inter_phase_gap_s': record.get('inter_phase_gap_s', 0.0),
+                },
+                'group_traces': self._group_traces_payload(record, cycle_start_ts),
+                'events': events,
+            }
+            with open(self.timeline_output_path, 'a') as f:
+                f.write(json.dumps(timeline_payload) + '\n')
+
+    def _print_running_summary(self):
+        valid = [r for r in self.completed if r['step'] >= self.warmup_steps]
+        if (
+            self.rank_id != 0
+            or not self.console_enabled
+            or len(valid) == 0
+            or len(valid) % self.log_every != 0
+        ):
+            return
+        means = self.summary()
+        print(
+            '[OverlapSummary] steps=%d '
+            'forward_total=%.6f forward_compute=%.6f backward_total=%.6f '
+            'rs_tail=%.6f ag_wait=%.6f update=%.6f '
+            'inter_phase_gap=%.6f'
+            % (
+                means['num_steps'],
+                means['forward_total_s'],
+                means['forward_compute_s'],
+                means['backward_total_s'],
+                means['rs_tail_wait_s'],
+                means['ag_wait_s'],
+                means['update_s'],
+                means['inter_phase_gap_s'],
+            ),
+            flush=True,
+        )
+
+    def _finalize_pending(self):
+        if self.pending is None:
+            return
+        record = self.pending
+        self.completed.append(record)
+        self._emit_record(record)
+        self._print_running_summary()
+        self.pending = None
+
+    def summary(self):
+        valid = [r for r in self.completed if r['step'] >= self.warmup_steps]
+        if len(valid) == 0:
+            return {'num_steps': 0}
+        keys = [
+            'forward_total_s',
+            'forward_compute_s',
+            'backward_total_s',
+            'rs_tail_wait_s',
+            'ag_wait_s',
+            'update_s',
+            'inter_phase_gap_s',
+        ]
+        summary = {'num_steps': len(valid)}
+        for key in keys:
+            summary[key] = float(np.mean([r[key] for r in valid]))
+        return summary
+
+    def append_summary(self, summary):
+        if self.rank_id != 0 or not self.summary_enabled or not self.output_path or summary.get('num_steps', 0) <= 0:
+            return
+        with open(self.output_path, 'a') as f:
+            f.write(
+                'SUMMARY,steps=%d,forward_total_s=%s,backward_total_s=%s,'
+                'forward_compute_s=%s,rs_tail_wait_s=%s,ag_wait_s=%s,update_s=%s,'
+                'inter_phase_gap_s=%s\n'
+                % (
+                    summary['num_steps'],
+                    summary['forward_total_s'],
+                    summary['backward_total_s'],
+                    summary['forward_compute_s'],
+                    summary['rs_tail_wait_s'],
+                    summary['ag_wait_s'],
+                    summary['update_s'],
+                    summary['inter_phase_gap_s'],
+                )
+            )
+
+    def finalize(self):
+        if not self.enabled:
+            return
+        if self.pending is not None:
+            self.pending = None
+            self.pending_forward = self._new_pending_forward()
+
+class _DistributedOptimizer(torch.optim.Optimizer):
+    def __init__(self, params, model, 
+            num_nearby_layers=NUM_NEARBY_LAYERS, 
+            threshold=THRESHOLD, 
+            exclude_parts='',
+            compression=None,
+            refresh_k=0,
+            active_prefix_enabled=True):  # 添加 compression 参数（压缩新增）
+        r"""Distributed optimizer with overlapping reduceScatter and allGather and tensor fusion.
+
+        Args:
+            params: optimizer parameters.
+            model: training model.
+            num_nearby_layers: number of neaby layers merged for tensor fusion.
+        """
+        super(self.__class__, self).__init__(params)
+        self._model = model
+        self._threshold = threshold
+        self._num_nearby_layers = num_nearby_layers
+        self._num_steps = 0
+        self._grad_accs = []
+        self._compression = compression  # 保存为实例属性（压缩新增）
+        self._refresh_k = int(refresh_k or 0)
+        if self._refresh_k > 0:
+            init_refresh_comms()
+        self._active_prefix_enabled = bool(active_prefix_enabled)
+        self._active_compression_factor = None
+        self._step_update_done = False
+        self._event_sync_enabled = os.environ.get('DEAR_EVENT_SYNC', '1') == '1'
+        self._comm_stats_output_path = os.environ.get('DEAR_COMM_STATS_OUTPUT', '')
+        self._comm_stats_every = max(1, int(os.environ.get('DEAR_COMM_STATS_EVERY', '1')))
+        self._comm_stats_logged = set()
+        if self._comm_stats_output_path and rank() == 0:
+            comm_stats_dir = os.path.dirname(self._comm_stats_output_path)
+            if comm_stats_dir:
+                os.makedirs(comm_stats_dir, exist_ok=True)
+            with open(self._comm_stats_output_path, 'w') as f:
+                f.write(
+                    'step,factor_kind,active_prefix_enabled,num_groups,'
+                    'logical_active_numel,communicated_numel,padded_communicated_numel,'
+                    'max_numel,max_padded_numel,logical_active_bytes,communicated_bytes,'
+                    'padded_communicated_bytes,max_bytes,max_padded_bytes,current_rank\n'
+                )
+        self._overlap_profiler = OverlapProfiler(
+            enabled=os.environ.get('DEAR_OVERLAP_PROFILE', '0') == '1',
+            summary_enabled=os.environ.get('DEAR_OVERLAP_SUMMARY', '0') == '1',
+            timeline_enabled=os.environ.get('DEAR_OVERLAP_TIMELINE', '0') == '1',
+            rank_id=rank(),
+            log_every=os.environ.get('DEAR_OVERLAP_LOG_EVERY', '10'),
+            warmup_steps=os.environ.get('DEAR_OVERLAP_WARMUP', '0'),
+            output_path=os.environ.get('DEAR_OVERLAP_OUTPUT', ''),
+            timeline_output_path=os.environ.get('DEAR_OVERLAP_TIMELINE_OUTPUT', ''),
+            console_enabled=os.environ.get('DEAR_OVERLAP_CONSOLE', '1') == '1',
+        )
+        self.param_to_group = {}
+        for group in self.param_groups:
+            for p in group['params']:
+                self.param_to_group[p] = group
+        
+        # 控制是否跳过某些 collective
+        self.exclude_reducescatter = True if exclude_parts.find('reducescatter') >=0 else False
+        self.exclude_allgather = True if exclude_parts.find('allgather') >=0 else False
+
+        # parameter names 建立 参数 → 名字 映射字典
+        named_parameters = list(model.named_parameters())
+        # 按内存地址去重，tied weights 只保留第一个名字
+        seen_ptrs = set()
+        deduped = []
+        for k, v in named_parameters:
+            if v.data_ptr() not in seen_ptrs:
+                seen_ptrs.add(v.data_ptr())
+                deduped.append((k, v))
+        named_parameters = deduped
+
+        if len(named_parameters) > 0:
+            self._param_names = {v: k for k, v in sorted(named_parameters)}
+        else:
+            self._param_names = {v: 'param.noname.%s' % i
+                                     for param_group in self.param_groups
+                                     for i, v in enumerate(param_group['params'])}
+
+        if size() > 1:
+            self._register_hooks() # 注册钩子backward hooks
+
+            if self._threshold is not None: # 分组的方法
+                self._generate_groups_with_threshold() # 按照通信量大小分组
+            else:
+                self._generate_groups_with_nearby_layers() # 按照组顺序分组
+
+    def _generate_groups_with_nearby_layers(self):
+        """
+        Generate groups with nearby layers for tensor fusion.
+        """
+        module_groups = []
+        current_group = []
+        for i, module in enumerate(self._register_modules):
+            current_group.append(module)
+            if not self._num_nearby_layers < 0 and (i+1) % self._num_nearby_layers == 0: 
+                module_groups.append(current_group)
+                current_group = []
+        if len(current_group) > 0:
+            module_groups.append(current_group)
+        self._prepare_tensor_fusion(module_groups)
+        
+    def _generate_groups_with_threshold(self):
+        """
+        Generate groups with buffer size threshold (in MB) for tensor fusion. 
+        """
+        module_sizes = {}
+        model_total_size = 0
+        for module in self._register_modules:
+            module_name = self._module_names[module]
+            tot_size = 0
+            for p in self._module_direct_parameters[module_name]:
+                tot_size += p.data.numel()
+                model_total_size += p.data.numel()
+            module_sizes[module_name] = tot_size*4/1024/1024
+        if rank() == 0:
+            print('# of parameters: ', model_total_size)
+
+        module_groups = []
+        current_group = []
+        tot_size = 0
+        for module in self._register_modules: # forward order
+            mod_size = module_sizes.get(self._module_names[module])
+            if tot_size == 0 or tot_size + mod_size < self._threshold:
+                current_group.append(module)
+                tot_size += mod_size
+            else:
+                module_groups.append(current_group)
+                current_group = [module]
+                tot_size = mod_size
+        if len(current_group) > 0:
+            module_groups.append(current_group)
+        self._prepare_tensor_fusion(module_groups)
+
+
+    def _prepare_tensor_fusion(self, module_groups):
+        """
+        Prepare tensor fusion based on module groups, e.g. [[m1, m2], [m3]] in forward order.
+        """
+        assert module_groups[0][0] == self._register_modules[0], "Module groups are not in forward order."
+        self._pad_buffers = []       # group buffers with padding
+        self._shard_buffers = []     # sharded group buffers
+        self._module_group_idx = {}  # get group idx of module by name
+        self._param_group_idx = {}   # get group idx of parameter by name
+        
+        start_p = 0
+        param_groups = []
+        for group_idx, module_group in enumerate(module_groups):
+            current_param_group = []
+            start_p = 0
+            for sub_idx, module in enumerate(module_group):
+                module_name = self._module_names[module]
+                self._module_group_idx[module_name] = (group_idx, sub_idx)
+
+                for p in self._module_direct_parameters[module_name]:
+                    param_name = self._param_names[p]
+                    numel = p.data.numel()
+                    self._param_group_idx[param_name] = (group_idx, len(current_param_group),
+                            start_p, start_p+numel)
+                    current_param_group.append(param_name)
+                    start_p += numel
+
+            param_groups.append(current_param_group)        
+            _, pad_tensor, shard_tensor = self._get_pad_tensor(p.data, start_p, size())
+            self._pad_buffers.append(pad_tensor)
+            self._shard_buffers.append(shard_tensor)
+
+        assert len(module_groups) == len(param_groups)
+        self._num_groups = len(module_groups)
+        self._group_module_counts = [len(group) for group in module_groups]
+        self._module_group_flags = [0]*len(module_groups) # check whether module group is gathered
+        self._param_group_flags = [[0]*len(g) for g in param_groups] # check whether param group is ready
+        self._rs_group_handles = [None] * self._num_groups
+        self._ag_group_handles = [None] * self._num_groups
+        self._rs_launch_order = []
+        self._compression_param_groups = param_groups
+        self._param_by_name = {}
+        topology_module_groups = [
+            [self._module_names[module] for module in module_group]
+            for module_group in module_groups
+        ]
+        group_stats = []
+        for group_idx, pad_buffer in enumerate(self._pad_buffers):
+            raw_numel = sum(
+                p.data.numel()
+                for module in module_groups[group_idx]
+                for p in self._module_direct_parameters[self._module_names[module]]
+            )
+            group_stats.append({
+                'uncompressed_numel': int(raw_numel),
+                'uncompressed_bytes': int(raw_numel * 4),
+                'uncompressed_mb': float(raw_numel * 4 / 1024 / 1024),
+                'uncompressed_buffer_numel': int(pad_buffer.numel()),
+                'uncompressed_buffer_bytes': int(pad_buffer.numel() * 4),
+                'uncompressed_buffer_mb': float(pad_buffer.numel() * 4 / 1024 / 1024),
+                'compressed_p_numel': None,
+                'compressed_p_bytes': None,
+                'compressed_p_mb': None,
+                'compressed_p_buffer_numel': None,
+                'compressed_p_buffer_bytes': None,
+                'compressed_p_buffer_mb': None,
+                'compressed_q_numel': None,
+                'compressed_q_bytes': None,
+                'compressed_q_mb': None,
+                'compressed_q_buffer_numel': None,
+                'compressed_q_buffer_bytes': None,
+                'compressed_q_buffer_mb': None,
+            })
+
+        if rank() == 0: 
+            print('#Tensor fusion groups:', len(module_groups))
+            print('Buffer sizes (MB):', 
+                    ', '.join('{:.2f}'.format(buf.numel()*4/1024/1024) for buf in self._pad_buffers))
+            print('module groups:', module_groups)
+            print('parameter groups:', param_groups)
+
+        # 压缩新增：为每个参数记录压缩后在 pad_buffer 中的位置
+        if self._compression :
+            self._compressed_param_offsets_p = {}  # name -> (group_idx, start, end)
+            self._compressed_param_offsets_q = {}  # name -> (group_idx, start, end)
+            compressed_group_sizes_p = []
+            compressed_group_sizes_q = []
+            for group_idx, module_group in enumerate(module_groups):
+                offset_p = 0
+                offset_q = 0
+                for module in module_group:
+                    module_name = self._module_names[module]
+                    for p in self._module_direct_parameters[module_name]:
+                        name = self._param_names[p]
+                        self._param_by_name[name] = p
+                        use_low_rank = True
+                        if hasattr(self._compression, 'should_compress_tensor'):
+                            use_low_rank = self._compression.should_compress_tensor(p, name=name)
+                        else:
+                            use_low_rank = p.ndimension() > 1
+
+                        if not use_low_rank:
+                            p_size = p.numel()
+                            q_size = p.numel()
+                        else:
+                            if hasattr(self._compression, 'max_rank_for'):
+                                rank_compression = self._compression.max_rank_for(name)
+                            else:
+                                rank_compression = self._compression.rank
+                            p_size = self._compression.get_factor_numel(
+                                p.shape, name=name, factor_kind='p', rank=rank_compression
+                            )
+                            q_size = self._compression.get_factor_numel(
+                                p.shape, name=name, factor_kind='q', rank=rank_compression
+                            )
+                        self._compressed_param_offsets_p[name] = (
+                            group_idx, offset_p, offset_p + p_size
+                        )
+                        self._compressed_param_offsets_q[name] = (
+                            group_idx, offset_q, offset_q + q_size
+                        )
+                        offset_p += p_size
+                        offset_q += q_size
+                compressed_group_sizes_p.append(offset_p)
+                compressed_group_sizes_q.append(offset_q)
+
+            # 新建压缩专用的 pad_buffer 和 shard_buffer
+            self._compressed_pad_buffers_p = []
+            self._compressed_shard_buffers_p = []
+            self._compressed_pad_buffers_q = []
+            self._compressed_shard_buffers_q = []
+            for group_idx, total_size in enumerate(compressed_group_sizes_p):
+                pad_num = size() - total_size % size()
+                if total_size % size() == 0:
+                    pad_num = 0
+                self._compressed_pad_buffers_p.append(
+                    torch.zeros(total_size + pad_num, device=self._pad_buffers[group_idx].device))
+                self._compressed_shard_buffers_p.append(
+                    torch.zeros((total_size + pad_num) // size(), device=self._pad_buffers[group_idx].device))
+            for group_idx, total_size in enumerate(compressed_group_sizes_q):
+                pad_num = size() - total_size % size()
+                if total_size % size() == 0:
+                    pad_num = 0
+                self._compressed_pad_buffers_q.append(
+                    torch.zeros(total_size + pad_num, device=self._pad_buffers[group_idx].device))
+                self._compressed_shard_buffers_q.append(
+                    torch.zeros((total_size + pad_num) // size(), device=self._pad_buffers[group_idx].device))
+
+            for group_idx, total_size in enumerate(compressed_group_sizes_p):
+                group_stats[group_idx].update({
+                    'compressed_p_numel': int(total_size),
+                    'compressed_p_bytes': int(total_size * 4),
+                    'compressed_p_mb': float(total_size * 4 / 1024 / 1024),
+                    'compressed_p_buffer_numel': int(self._compressed_pad_buffers_p[group_idx].numel()),
+                    'compressed_p_buffer_bytes': int(self._compressed_pad_buffers_p[group_idx].numel() * 4),
+                    'compressed_p_buffer_mb': float(self._compressed_pad_buffers_p[group_idx].numel() * 4 / 1024 / 1024),
+                })
+            for group_idx, total_size in enumerate(compressed_group_sizes_q):
+                group_stats[group_idx].update({
+                    'compressed_q_numel': int(total_size),
+                    'compressed_q_bytes': int(total_size * 4),
+                    'compressed_q_mb': float(total_size * 4 / 1024 / 1024),
+                    'compressed_q_buffer_numel': int(self._compressed_pad_buffers_q[group_idx].numel()),
+                    'compressed_q_buffer_bytes': int(self._compressed_pad_buffers_q[group_idx].numel() * 4),
+                    'compressed_q_buffer_mb': float(self._compressed_pad_buffers_q[group_idx].numel() * 4 / 1024 / 1024),
+                })
+            self._compressed_group_sizes_p = compressed_group_sizes_p
+            self._compressed_group_sizes_q = compressed_group_sizes_q
+            self._active_compression_layout_step = None
+            self._active_compression_layout_factor = None
+            self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
+            self._active_compressed_param_offsets_q = self._compressed_param_offsets_q
+            self._active_compressed_group_sizes_p = compressed_group_sizes_p
+            self._active_compressed_group_sizes_q = compressed_group_sizes_q
+            self._active_compressed_padded_group_sizes_p = [
+                buf.numel() for buf in self._compressed_pad_buffers_p
+            ]
+            self._active_compressed_padded_group_sizes_q = [
+                buf.numel() for buf in self._compressed_pad_buffers_q
+            ]
+            self._active_compression_layout_key = None
+            self._active_compression_layout_cache = {}
+
+        self._overlap_profiler.set_topology(topology_module_groups, group_stats=group_stats)
+        self._refresh_first_handles = [None] * self._num_groups
+        self._refresh_second_handles = [None] * self._num_groups
+        self._refresh_first_done = [False] * self._num_groups
+        self._refresh_second_done = [False] * self._num_groups
+        self._refresh_first_kind = None
+        self._refresh_second_kind = None
+        self._refresh_launch_order = []
+        self._refresh_next_second_pos = 0
+        self._refresh_pending_first_groups = []
+        
+    @torch.no_grad()
+    def _get_pad_tensor(self, tensor, numel, size): 
+        """
+        Get padding tensors
+        """
+        pad_num = size - numel % size
+        pad_tensor = tensor.new_empty(numel+pad_num)
+        shard_tensor = tensor.new_empty((numel+pad_num) // size)
+        return pad_num, pad_tensor, shard_tensor
+
+    def _compression_factor_kind(self, step=None):
+        if step is None:
+            step = self._num_steps
+        if hasattr(self._compression, 'factor_kind'):
+            return self._compression.factor_kind(step)
+        return 'p' if step % 2 == 0 else 'q'
+
+    def _compression_offsets_for_factor(self, factor_kind):
+        if hasattr(self, '_active_compressed_param_offsets_p'):
+            if factor_kind == 'p':
+                return self._active_compressed_param_offsets_p
+            return self._active_compressed_param_offsets_q
+        if factor_kind == 'p':
+            return self._compressed_param_offsets_p
+        return self._compressed_param_offsets_q
+
+    def _compression_buffers_for_factor(self, factor_kind):
+        if factor_kind == 'p':
+            return self._compressed_pad_buffers_p, self._compressed_shard_buffers_p
+        return self._compressed_pad_buffers_q, self._compressed_shard_buffers_q
+
+    def _active_group_sizes_for_factor(self, factor_kind):
+        if factor_kind == 'p':
+            return self._active_compressed_group_sizes_p, self._active_compressed_padded_group_sizes_p
+        return self._active_compressed_group_sizes_q, self._active_compressed_padded_group_sizes_q
+
+    def _compute_step_compression_layout(self, step):
+        active_offsets_p = {}
+        active_offsets_q = {}
+        group_sizes_p = []
+        group_sizes_q = []
+
+        for group_idx, param_group in enumerate(self._compression_param_groups):
+            offset_p = 0
+            offset_q = 0
+            for name in param_group:
+                p = self._param_by_name[name]
+                use_low_rank = True
+                if hasattr(self._compression, 'should_compress_tensor'):
+                    use_low_rank = self._compression.should_compress_tensor(p, name=name)
+                else:
+                    use_low_rank = p.ndimension() > 1
+
+                if not use_low_rank:
+                    p_size = p.numel()
+                    q_size = p.numel()
+                else:
+                    if hasattr(self._compression, 'get_rank_for_step'):
+                        rank_c = self._compression.get_rank_for_step(name, p.shape, step)
+                    else:
+                        rank_c = self._compression.get_rank_for(name, p.shape)
+                    p_size = self._compression.get_factor_numel(
+                        p.shape, name=name, factor_kind='p', rank=rank_c
+                    )
+                    q_size = self._compression.get_factor_numel(
+                        p.shape, name=name, factor_kind='q', rank=rank_c
+                    )
+
+                active_offsets_p[name] = (group_idx, offset_p, offset_p + p_size)
+                active_offsets_q[name] = (group_idx, offset_q, offset_q + q_size)
+                offset_p += p_size
+                offset_q += q_size
+
+            group_sizes_p.append(offset_p)
+            group_sizes_q.append(offset_q)
+
+        return active_offsets_p, active_offsets_q, group_sizes_p, group_sizes_q
+
+    def _prepare_active_compression_layout(self, step, factor_kind):
+        if not self._compression:
+            return
+        if not self._active_prefix_enabled:
+            self._active_compressed_param_offsets_p = self._compressed_param_offsets_p
+            self._active_compressed_param_offsets_q = self._compressed_param_offsets_q
+            self._active_compressed_group_sizes_p = self._compressed_group_sizes_p
+            self._active_compressed_group_sizes_q = self._compressed_group_sizes_q
+            self._active_compressed_padded_group_sizes_p = [
+                buf.numel() for buf in self._compressed_pad_buffers_p
+            ]
+            self._active_compressed_padded_group_sizes_q = [
+                buf.numel() for buf in self._compressed_pad_buffers_q
+            ]
+            self._active_compression_layout_step = step
+            self._active_compression_layout_factor = factor_kind
+            self._active_compression_layout_key = ('max',)
+            return
+
+        if hasattr(self._compression, 'layout_cache_key'):
+            layout_key = self._compression.layout_cache_key(step)
+        else:
+            layout_key = ('step', int(step))
+
+        if (
+            getattr(self, '_active_compression_layout_key', None) == layout_key
+        ):
+            return
+
+        layout_cache = getattr(self, '_active_compression_layout_cache', None)
+        if layout_cache is None:
+            layout_cache = {}
+            self._active_compression_layout_cache = layout_cache
+        cached_layout = layout_cache.get(layout_key)
+        if cached_layout is not None:
+            (
+                self._active_compressed_param_offsets_p,
+                self._active_compressed_param_offsets_q,
+                self._active_compressed_group_sizes_p,
+                self._active_compressed_group_sizes_q,
+                self._active_compressed_padded_group_sizes_p,
+                self._active_compressed_padded_group_sizes_q,
+            ) = cached_layout
+            self._active_compression_layout_step = step
+            self._active_compression_layout_factor = factor_kind
+            self._active_compression_layout_key = layout_key
+            return
+
+        active_offsets_p, active_offsets_q, group_sizes_p, group_sizes_q = (
+            self._compute_step_compression_layout(step)
+        )
+
+        def _padded_sizes(group_sizes, max_buffers):
+            padded = []
+            for group_idx, total_size in enumerate(group_sizes):
+                pad_num = size() - total_size % size()
+                if total_size % size() == 0:
+                    pad_num = 0
+                padded_size = total_size + pad_num
+                if padded_size > max_buffers[group_idx].numel():
+                    raise RuntimeError(
+                        'Active compression buffer overflow at group %d: active=%d max=%d'
+                        % (group_idx, padded_size, max_buffers[group_idx].numel())
+                    )
+                padded.append(padded_size)
+            return padded
+
+        self._active_compressed_param_offsets_p = active_offsets_p
+        self._active_compressed_param_offsets_q = active_offsets_q
+        self._active_compressed_group_sizes_p = group_sizes_p
+        self._active_compressed_group_sizes_q = group_sizes_q
+        self._active_compressed_padded_group_sizes_p = _padded_sizes(
+            group_sizes_p, self._compressed_pad_buffers_p
+        )
+        self._active_compressed_padded_group_sizes_q = _padded_sizes(
+            group_sizes_q, self._compressed_pad_buffers_q
+        )
+        layout_cache[layout_key] = (
+            self._active_compressed_param_offsets_p,
+            self._active_compressed_param_offsets_q,
+            self._active_compressed_group_sizes_p,
+            self._active_compressed_group_sizes_q,
+            self._active_compressed_padded_group_sizes_p,
+            self._active_compressed_padded_group_sizes_q,
+        )
+        self._active_compression_layout_step = step
+        self._active_compression_layout_factor = factor_kind
+        self._active_compression_layout_key = layout_key
+
+    def _compression_group_buffer_views_for_factor(self, factor_kind, group_idx):
+        pad_buffers, shard_buffers = self._compression_buffers_for_factor(factor_kind)
+        _, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
+        padded_size = padded_sizes[group_idx]
+        shard_size = padded_size // size()
+        return (
+            pad_buffers[group_idx][:padded_size],
+            shard_buffers[group_idx][:shard_size],
+        )
+
+    def _zero_active_padding_for_factor(self, factor_kind, group_idx):
+        pad_buffers, _ = self._compression_buffers_for_factor(factor_kind)
+        group_sizes, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
+        total_size = group_sizes[group_idx]
+        padded_size = padded_sizes[group_idx]
+        if padded_size > total_size:
+            pad_buffers[group_idx][total_size:padded_size].zero_()
+
+    def _current_rank_for_stats(self, step):
+        if not self._compression:
+            return ''
+        if (
+            getattr(self._compression, 'update_norm_stable_rank', False)
+            and
+            hasattr(self._compression, 'stable_rank_levels')
+            and hasattr(self._compression, 'global_rank_level_idx')
+            and self._compression.stable_rank_levels
+        ):
+            idx = int(self._compression.global_rank_level_idx)
+            idx = max(0, min(idx, len(self._compression.stable_rank_levels) - 1))
+            return self._compression.stable_rank_levels[idx]
+        if hasattr(self._compression, '_scheduled_base_rank'):
+            return self._compression._scheduled_base_rank(step)
+        if hasattr(self._compression, 'default_rank'):
+            return self._compression.default_rank
+        if hasattr(self._compression, 'rank'):
+            return self._compression.rank
+        return ''
+
+    def _log_comm_stats(self, step, factor_kind):
+        if (
+            not self._comm_stats_output_path
+            or rank() != 0
+            or not self._compression
+            or not hasattr(self, '_compressed_pad_buffers_p')
+        ):
+            return
+        compressed_step_idx = max(1, int(step) - int(self._compression.warmup_steps))
+        if (compressed_step_idx - 1) % self._comm_stats_every != 0:
+            return
+        key = (int(step), factor_kind)
+        if key in self._comm_stats_logged:
+            return
+        self._comm_stats_logged.add(key)
+
+        group_sizes, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
+        if factor_kind == 'p':
+            max_sizes = self._compressed_group_sizes_p
+            max_padded_sizes = [buf.numel() for buf in self._compressed_pad_buffers_p]
+        else:
+            max_sizes = self._compressed_group_sizes_q
+            max_padded_sizes = [buf.numel() for buf in self._compressed_pad_buffers_q]
+
+        if self._active_prefix_enabled:
+            logical_sizes = group_sizes
+        else:
+            _, _, logical_p_sizes, logical_q_sizes = self._compute_step_compression_layout(step)
+            logical_sizes = logical_p_sizes if factor_kind == 'p' else logical_q_sizes
+
+        logical_numel = int(sum(logical_sizes))
+        communicated_numel = int(sum(group_sizes))
+        padded_communicated_numel = int(sum(padded_sizes))
+        max_numel = int(sum(max_sizes))
+        max_padded_numel = int(sum(max_padded_sizes))
+        current_rank = self._current_rank_for_stats(step)
+        with open(self._comm_stats_output_path, 'a') as f:
+            f.write(
+                '%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n'
+                % (
+                    int(step),
+                    factor_kind,
+                    1 if self._active_prefix_enabled else 0,
+                    int(self._num_groups),
+                    logical_numel,
+                    communicated_numel,
+                    padded_communicated_numel,
+                    max_numel,
+                    max_padded_numel,
+                    logical_numel * 4,
+                    communicated_numel * 4,
+                    padded_communicated_numel * 4,
+                    max_numel * 4,
+                    max_padded_numel * 4,
+                    str(current_rank),
+                )
+            )
+
+    def _is_refresh_step(self):
+        if not self._compression or self._refresh_k <= 0:
+            return False
+        if self._num_steps <= self._compression.warmup_steps:
+            return False
+        return (self._num_steps - self._compression.warmup_steps) % self._refresh_k == 0
+
+    def _other_factor_kind(self, factor_kind):
+        return 'q' if factor_kind == 'p' else 'p'
+
+    def _refresh_push_to_buffer(self, name, tensor):
+        group_idx, sub_idx, start_p, end_p = self._param_group_idx[name]
+        with torch.no_grad():
+            self._pad_buffers[group_idx][start_p:end_p].copy_(tensor.view(-1))
+            self._param_group_flags[group_idx][sub_idx] = 1
+            for flag in self._param_group_flags[group_idx]:
+                if flag == 0:
+                    return
+            self._refresh_pending_first_groups.append(group_idx)
+
+    def _refresh_launch_first_group(self, group_idx):
+        step = self._num_steps
+        first_kind = self._compression_factor_kind(step)
+        self._refresh_first_kind = first_kind
+        self._refresh_second_kind = self._other_factor_kind(first_kind)
+        self._prepare_active_compression_layout(step, first_kind)
+        offsets = self._compression_offsets_for_factor(first_kind)
+        pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
+        pad_buf = pad_buffers[group_idx]
+        group_size = self._active_group_sizes_for_factor(first_kind)[0][group_idx]
+        if group_size > 0:
+            pad_buf[:group_size].zero_()
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            _, _, raw_start, raw_end = self._param_group_idx[name]
+            raw_grad = self._pad_buffers[group_idx][raw_start:raw_end].view(p.shape)
+            vector = self._compression.compute_factor(
+                raw_grad,
+                name,
+                step=step,
+                factor_kind=first_kind,
+                update_residual=False,
+            )
+            _, start, end = offsets[name]
+            actual_end = start + vector.numel()
+            pad_buf[start:actual_end].copy_(vector.view(-1))
+            if actual_end < end:
+                pad_buf[actual_end:end].zero_()
+        self._zero_active_padding_for_factor(first_kind, group_idx)
+        pad_view, _ = self._compression_group_buffer_views_for_factor(first_kind, group_idx)
+        if hasattr(refresh_first_comm, 'waitCurrentStream'):
+            refresh_first_comm.waitCurrentStream()
+        else:
+            torch.cuda.current_stream(device=pad_view.device).synchronize()
+        handle = refresh_first_comm.allReduce(pad_view)
+        self._refresh_first_handles[group_idx] = -1 if handle is None else handle
+        self._refresh_launch_order.append(group_idx)
+
+    def _refresh_load_factor_group(self, group_idx, factor_kind):
+        offsets = self._compression_offsets_for_factor(factor_kind)
+        pad_buffers, _ = self._compression_buffers_for_factor(factor_kind)
+        pad_buf = pad_buffers[group_idx]
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            if not self._compression.should_compress_tensor(p, name=name):
+                continue
+            rank_c = self._compression.get_rank_for(name, p.shape)
+            curr_size = self._compression.get_factor_numel(
+                p.shape,
+                name=name,
+                factor_kind=factor_kind,
+                rank=rank_c,
+            )
+            _, start, _ = offsets[name]
+            self._compression.load_factor(
+                pad_buf[start:start + curr_size],
+                p.size(),
+                name,
+                step=self._num_steps,
+                factor_kind=factor_kind,
+            )
+
+    def _refresh_launch_second_group(self, group_idx):
+        step = self._num_steps
+        second_kind = self._refresh_second_kind
+        self._prepare_active_compression_layout(step, second_kind)
+        offsets = self._compression_offsets_for_factor(second_kind)
+        pad_buffers, _ = self._compression_buffers_for_factor(second_kind)
+        pad_buf = pad_buffers[group_idx]
+        group_size = self._active_group_sizes_for_factor(second_kind)[0][group_idx]
+        if group_size > 0:
+            pad_buf[:group_size].zero_()
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            if not self._compression.should_compress_tensor(p, name=name):
+                continue
+            _, _, raw_start, raw_end = self._param_group_idx[name]
+            raw_grad = self._pad_buffers[group_idx][raw_start:raw_end].view(p.shape)
+            vector = self._compression.compute_factor(
+                raw_grad,
+                name,
+                step=step,
+                factor_kind=second_kind,
+                update_residual=False,
+            )
+            _, start, end = offsets[name]
+            actual_end = start + vector.numel()
+            pad_buf[start:actual_end].copy_(vector.view(-1))
+            if actual_end < end:
+                pad_buf[actual_end:end].zero_()
+        self._zero_active_padding_for_factor(second_kind, group_idx)
+        pad_view, _ = self._compression_group_buffer_views_for_factor(second_kind, group_idx)
+        if hasattr(refresh_second_comm, 'waitCurrentStream'):
+            refresh_second_comm.waitCurrentStream()
+        else:
+            torch.cuda.current_stream(device=pad_view.device).synchronize()
+        handle = refresh_second_comm.allReduce(pad_view)
+        self._refresh_second_handles[group_idx] = -1 if handle is None else handle
+
+    def _refresh_finish_first_group(self, group_idx, blocking=False):
+        handle = self._refresh_first_handles[group_idx]
+        if handle is None or self._refresh_first_done[group_idx]:
+            return self._refresh_first_done[group_idx]
+        if handle == -1:
+            if not blocking:
+                return False
+            refresh_first_comm.synchronize()
+        elif blocking:
+            refresh_first_comm.syncEvent(handle)
+        elif hasattr(refresh_first_comm, 'queryEvent'):
+            if not refresh_first_comm.queryEvent(handle):
+                return False
+            refresh_first_comm.syncEvent(handle)
+        else:
+            return False
+        first_kind = self._refresh_first_kind
+        first_pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
+        first_pad_buffers[group_idx].div_(size())
+        self._refresh_load_factor_group(group_idx, first_kind)
+        self._refresh_first_done[group_idx] = True
+        return True
+
+    def _refresh_finish_second_group(self, group_idx, blocking=False):
+        handle = self._refresh_second_handles[group_idx]
+        if handle is None or self._refresh_second_done[group_idx]:
+            return self._refresh_second_done[group_idx]
+        if handle == -1:
+            if not blocking:
+                return False
+            refresh_second_comm.synchronize()
+        elif blocking:
+            refresh_second_comm.syncEvent(handle)
+        elif hasattr(refresh_second_comm, 'queryEvent'):
+            if not refresh_second_comm.queryEvent(handle):
+                return False
+            refresh_second_comm.syncEvent(handle)
+        else:
+            return False
+        second_kind = self._refresh_second_kind
+        second_pad_buffers, _ = self._compression_buffers_for_factor(second_kind)
+        second_pad_buffers[group_idx].div_(size())
+        self._refresh_load_factor_group(group_idx, second_kind)
+        self._refresh_second_done[group_idx] = True
+        return True
+
+    def _refresh_progress(self, blocking=False):
+        while True:
+            made_progress = False
+            for group_idx in self._refresh_launch_order:
+                if (
+                    not self._refresh_first_done[group_idx]
+                    and self._refresh_finish_first_group(group_idx, blocking=blocking)
+                ):
+                    made_progress = True
+            while self._refresh_next_second_pos < len(self._refresh_launch_order):
+                group_idx = self._refresh_launch_order[self._refresh_next_second_pos]
+                if not self._refresh_first_done[group_idx]:
+                    break
+                self._refresh_launch_second_group(group_idx)
+                self._refresh_next_second_pos += 1
+                made_progress = True
+            if (
+                self._refresh_next_second_pos == len(self._refresh_launch_order)
+                and self._refresh_pending_first_groups
+            ):
+                self._refresh_launch_first_group(self._refresh_pending_first_groups.pop(0))
+                made_progress = True
+            if not made_progress:
+                break
+        for group_idx in self._refresh_launch_order:
+            self._refresh_finish_second_group(group_idx, blocking=blocking)
+
+    def _refresh_update_group(self, group_idx):
+        first_kind = self._refresh_first_kind
+        first_offsets = self._compression_offsets_for_factor(first_kind)
+        first_pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
+        first_pad_buf = first_pad_buffers[group_idx]
+        for name in self._compression_param_groups[group_idx]:
+            p = self._param_by_name[name]
+            _, _, raw_start, raw_end = self._param_group_idx[name]
+            raw_grad = self._pad_buffers[group_idx][raw_start:raw_end].view(p.shape)
+            if self._compression.should_compress_tensor(p, name=name):
+                grad = self._compression.reconstruct_from_memory(p.size(), name)
+                self._compression.update_residual_from_memory(raw_grad, name)
+            else:
+                _, start, end = first_offsets[name]
+                grad = first_pad_buf[start:end].view(p.shape).clone()
+            self._sgd(p, grad)
+
+    def _refresh_drain(self):
+        if not self._refresh_launch_order and not self._refresh_pending_first_groups:
+            return
+        self._refresh_progress(blocking=True)
+        for group_idx, done in enumerate(self._refresh_second_done):
+            if not done:
+                continue
+            self._refresh_update_group(group_idx)
+        self._refresh_first_handles = [None] * self._num_groups
+        self._refresh_second_handles = [None] * self._num_groups
+        self._refresh_first_done = [False] * self._num_groups
+        self._refresh_second_done = [False] * self._num_groups
+        self._refresh_first_kind = None
+        self._refresh_second_kind = None
+        self._refresh_launch_order = []
+        self._refresh_next_second_pos = 0
+        self._refresh_pending_first_groups = []
+        if hasattr(refresh_first_comm, 'clearEvents'):
+            refresh_first_comm.clearEvents()
+        if hasattr(refresh_second_comm, 'clearEvents'):
+            refresh_second_comm.clearEvents()
+        for group_idx in range(len(self._param_group_flags)):
+            self._param_group_flags[group_idx] = [0] * len(self._param_group_flags[group_idx])
+        self._module_group_flags = [0] * self._num_groups
+
+    def profile_step_begin(self):
+        self._overlap_profiler.begin_step(self._num_steps)
+
+    def profile_forward_start(self):
+        self._overlap_profiler.note_forward_start(self._num_steps)
+
+    def profile_forward_done(self, duration_s=None):
+        self._overlap_profiler.note_forward_total(duration_s, self._num_steps)
+
+    def profile_backward_start(self):
+        self._overlap_profiler.note_backward_start()
+
+    def profile_backward_done(self, duration_s=None):
+        self._overlap_profiler.note_backward_total(duration_s)
+
+    def profile_summary(self):
+        self._overlap_profiler.finalize()
+        summary = self._overlap_profiler.summary()
+        self._overlap_profiler.append_summary(summary)
+        return summary
+
+    def _register_hooks(self):
+        """
+        Register hooks for both feed-forward and back-propagation. 
+        """
+        # find all trainable modules and parameters
+        self._register_modules = []
+        self._register_parameters = []
+        self._module_names = {}             # get module name
+        self._module_direct_parameters = {} # get module direct params by name
+        
+        """ 修改去重方式。
+        register_param_names = []
+        for module in self._model.modules():
+            params = [p for p in module.parameters(recurse=False) if p.requires_grad]
+            direct_params = []
+            for p in params:
+                # avoid repeat registration, e.g. shared parameters
+                p_name = self._param_names.get(p)
+                if p_name not in register_param_names:
+                    register_param_names.append(p_name)
+                    direct_params.append(p)
+        """
+        register_param_ptrs = []  # 改为按内存地址去重
+        for module in self._model.modules():
+            params = [p for p in module.parameters(recurse=False) if p.requires_grad]
+            direct_params = []
+            for p in params:
+                if p.data_ptr() not in register_param_ptrs:
+                    register_param_ptrs.append(p.data_ptr())
+                    direct_params.append(p)
+
+            if len(direct_params) > 0:
+                module_name = 'module_name_%s_%d' % (module.__class__.__name__, 
+                        len(self._register_modules))
+                self._module_names[module] = module_name
+                self._register_modules.append(module)
+                self._register_parameters.extend(direct_params)
+                self._module_direct_parameters[module_name] = direct_params
+        
+        # register forward hooks 
+        for i, module in enumerate(self._register_modules):
+            if self.exclude_allgather: # for time breakdown record
+                break
+            module.register_forward_pre_hook(self._forward_pre_hook) # 为模型注册 前向传播钩子
+            module.register_forward_hook(self._forward_hook)
+        
+        # register backward hooks
+        for i, p in enumerate(self._register_parameters):
+            if self.exclude_reducescatter: # for time breakdown record
+                break
+            # ❌ 删掉这行
+            # p.grad = p.data.new(p.size()).zero_()
+            # ❌ 删掉这三行：
+            # p_tmp = p.expand_as(p)
+            # grad_acc = p_tmp.grad_fn.next_functions[0][0]
+            # grad_acc.register_hook(self._make_hook(p))
+            # self._grad_accs.append(grad_acc)
+            # ✅ 改成一行：
+            p.register_hook(self._make_hook(p))
+            #if rank() == 0:
+            #    print("register hook for %s" % self._param_names.get(p))
+    
+    def _make_hook(self, p):
+        def hook(grad):
+            name = self._param_names.get(p)
+
+            # -------------------------------------------------------下面的代码加上之后 baseline不报NaN-------------------------------------------------------
+            # 强制流同步（确保计算指令已发出）
+            # torch.cuda.current_stream().synchronize()
+            # 3. 【核心】原位空算，强制触发 L2 Cache 刷新到 VRAM
+            # 这是一个读写操作，效果类似于 cpu() 的内存屏障，但在 GPU 内部完成
+            # grad.add_(0)
+
+            # 加入这个就完全不报错了
+            # if torch.isnan(grad).any():
+            #     print(f"[NaN in hook] step={self._num_steps}, name={name}, "
+            #        f"max={grad.abs().max().item():.3e}")
+            # -------------------------------------------------------上面的代码加上之后 baseline不报NaN-------------------------------------------------------
+            tensor = grad   # ✅ 用这个！！！
+
+            if self._is_refresh_step():
+                self._refresh_push_to_buffer(name, tensor)
+                self._refresh_progress(blocking=False)
+            elif self._compression and self._num_steps > self._compression.warmup_steps:
+                factor_kind = self._compression_factor_kind(self._num_steps)
+                self._prepare_active_compression_layout(self._num_steps, factor_kind)
+                compressed_offsets = self._compression_offsets_for_factor(factor_kind)
+                compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(factor_kind)
+
+                # 调用压缩函数
+                compressed_vector, _, _ = self._compression.compress(tensor, name, step=self._num_steps)
+                # 写入压缩专用 buffer
+                group_idx, start, end = compressed_offsets[name]
+
+                with torch.no_grad():
+                    pad_buf = compressed_pad_buffers[group_idx]
+
+                    # 重要：写入时使用 compressed_vector 的实际大小，而不是 end-start
+                    # 因为 P 和 Q 的长度可能不一致，我们 buffer 是按 max 分配的
+                    actual_end = start + compressed_vector.numel()
+                    # print(f"name={name}, compressed_vector size={compressed_vector.numel()}, buf slot size={end-start}")
+                    pad_buf[start:actual_end].copy_(compressed_vector.view(-1))
+                    if actual_end < end:
+                        pad_buf[actual_end:end].zero_()
+                    # 标记 flag（复用原有 flag 机制）
+                    # 这里没有和（原有逻辑）一样： 调用pad_grad，而是自己复现了（如果一个组的flag都ok了，说明整个通信组才可以触发通信）
+                    _, sub_idx, _, _ = self._param_group_idx[name]
+                    self._param_group_flags[group_idx][sub_idx] = 1
+                    for flag in self._param_group_flags[group_idx]:
+                        if flag == 0:
+                            return
+                    # 全部 ready，触发通信（用压缩 buffer）
+                    comm_name = 'reduceScatter-group-%d' % group_idx
+                    self._zero_active_padding_for_factor(factor_kind, group_idx)
+                    pad_view, shard_view = self._compression_group_buffer_views_for_factor(
+                        factor_kind, group_idx
+                    )
+                    self._overlap_profiler.note_rs_ready(group_idx=group_idx)
+                    handle = reduce_scatter_comm.collective_async_(
+                        comm_name,
+                        pad_view,
+                        shard_view,
+                        profiler=self._overlap_profiler,
+                        group_idx=group_idx,
+                    )
+                    self._rs_group_handles[group_idx] = handle
+                    self._rs_launch_order.append((group_idx, handle))
+            else:
+                # 原有逻辑，push_to_buffer函数满了，才会返回pad_grad != None
+                new_name, pad_grad, shard_grad = self._push_to_buffer(name, tensor)
+                if pad_grad is not None:
+                    rs_group_idx = self._param_group_idx[name][0]
+                    self._overlap_profiler.note_rs_ready(group_idx=rs_group_idx)
+                    handle = reduce_scatter_comm.collective_async_(
+                        new_name,
+                        pad_grad,
+                        shard_grad,
+                        profiler=self._overlap_profiler,
+                        group_idx=rs_group_idx,
+                    )
+                    self._rs_group_handles[rs_group_idx] = handle
+                    self._rs_launch_order.append((rs_group_idx, handle))
+            return grad # 注意：hook 应该返回处理后的 grad
+        return hook
+    
+    """  上面改为压缩版，创建了分支
+    def _make_hook(self, p):
+
+        # Add hooks for backward propagation. 
+
+        
+        def hook(*ignore): #  在hook中，一旦被触发，就会引用self._push_to_buffer和reduce_scatter_comm.collective_async_两个函数
+    
+            name = self._param_names.get(p)
+            tensor = p.grad.data
+            # 下面一行为新加的压缩代码（压缩新增）
+            assert not p.grad.requires_grad
+
+            # 添加梯度压缩（压缩新增）
+            if self._compression:
+                tensor_compressed, ctx, _ = self._compression.compress(tensor, name)
+                tensor = tensor_compressed
+
+            # Merging gradient tensors with padding for reduce_scatter推送梯度到缓冲区
+            new_name, pad_grad, shard_grad = self._push_to_buffer(name, tensor)
+            if pad_grad is not None:  # padding 完毕之后才会通信，# not ready就不会通信。
+                # RS 的真正触发点：backward hook,只有当 一个 group 的所有参数都 ready 时，hook 被调用梯度被 copy 到 fusion buffer
+                handle = reduce_scatter_comm.collective_async_(new_name, pad_grad, shard_grad)
+                #if rank() == 0:
+                    #print("BP ReduceScatter:", handle)
+        return hook
+    """
+
+    def _push_to_buffer(self, name, tensor):
+        """
+        Push tensor to buffer for fusion.
+        """
+        group_idx, sub_idx, start_p, end_p = self._param_group_idx[name]
+        with torch.no_grad():
+            pad_buffer = self._pad_buffers[group_idx]
+            pad_buffer[start_p:end_p].copy_(tensor.view(-1))
+            self._param_group_flags[group_idx][sub_idx] = 1
+            for flag in self._param_group_flags[group_idx]:
+                if flag == 0: # not ready
+                    return name, None, None
+            comm_name = 'reduceScatter-group-%d' % group_idx
+            shard_buffer = self._shard_buffers[group_idx]
+            return comm_name, pad_buffer, shard_buffer
+
+    def _forward_pre_hook(self, module, input):
+        """
+        Add hooks for pre-feedfoward.
+        """
+        if torch.is_grad_enabled() and self._num_steps > 0 and not self._step_update_done:
+            name = self._module_names.get(module)
+            group_idx, sub_idx = self._module_group_idx[name]
+
+            # Sync this group's allGather on the first actual module that enters
+            # forward, because module registration order may differ from runtime
+            # forward order for shared/embedding modules.
+            if self._module_group_flags[group_idx] == 0:
+                
+                # 等待上一组AG同步完成（Group0的AG是由step函数发起的）
+                ag_wait_start = time.perf_counter()
+                ag_handle = self._ag_group_handles[group_idx]
+                event_wait_issued = (
+                    self._event_sync_enabled
+                    and all_gather_comm.wait_event_on_current_stream(ag_handle)
+                )
+                if not event_wait_issued:
+                    all_gather_comm.synchronize()
+                self._overlap_profiler.note_ag_wait(
+                    start_ts=ag_wait_start,
+                    end_ts=time.perf_counter(),
+                    group_idx=group_idx,
+                    module_name=name,
+                )
+                # torch.cuda.synchronize() 
+                # torch.cuda.current_stream().synchronize()
+                # print("Rank %d: Step %d, AllGather group %d time: %.10f sec" % (rank(), self._num_steps, group_idx, ag_time))
+                
+                # 发起下一轮的AG通信
+                self._module_group_flags[group_idx] = 1  # done
+                if group_idx < self._num_groups - 1 and self._module_group_flags[group_idx+1] == 0:
+                    self._allgather_one_group(group_idx+1)
+                elif self._event_sync_enabled and group_idx == self._num_groups - 1:
+                    all_gather_comm.clear_synchronized()
+                    self._ag_group_handles = [None] * self._num_groups
+            # update params for this module
+            self._update_one_module(module, name, group_idx)
+            if sub_idx == 0:
+                self._overlap_profiler.note_forward_gate(
+                    group_idx=group_idx,
+                    module_name=name,
+                )
+
+    def _forward_hook(self, module, input, output):
+        if torch.is_grad_enabled() and self._num_steps > 0 and not self._step_update_done:
+            name = self._module_names.get(module)
+            group_idx, sub_idx = self._module_group_idx[name]
+            if sub_idx == self._group_module_counts[group_idx] - 1:
+                self._overlap_profiler.note_forward_end(
+                    group_idx=group_idx,
+                    module_name=name,
+                )
+
+    def _update_one_module(self, module, module_name, group_idx):
+        # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
+        # torch.cuda.synchronize()
+        # -------------------------------------------------------上面的代码加上之后 compress不报NaN-------------------------------------------------------
+        profile_enabled = self._overlap_profiler.enabled
+        strict_sync_enabled = os.environ.get('DEAR_OVERLAP_NEEDS_SYNC', '0') == '1'
+        if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        update_start = time.perf_counter()
+        update_norm_enabled = (
+            self._active_compression_factor is not None
+            and hasattr(self._compression, 'wants_update_norm_observation')
+            and self._compression.wants_update_norm_observation()
+        )
+        group_update_norm_sq_terms = [] if update_norm_enabled else None
+        for p in self._module_direct_parameters[module_name]:
+            name = self._param_names.get(p)
+
+            if self._active_compression_factor is not None:
+                self._prepare_active_compression_layout(
+                    self._num_steps - 1, self._active_compression_factor
+                )
+                compressed_offsets = self._compression_offsets_for_factor(self._active_compression_factor)
+                compressed_pad_buffers, _ = self._compression_buffers_for_factor(self._active_compression_factor)
+                _, start, end = compressed_offsets[name]
+                # 判断逻辑要与 compress 严格一致
+                use_low_rank = True
+                if hasattr(self._compression, 'should_compress_tensor'):
+                    use_low_rank = self._compression.should_compress_tensor(p, name=name)
+                else:
+                    use_low_rank = p.ndimension() > 1
+
+                if use_low_rank:
+                    rank_c = self._compression.get_rank_for(name, p.shape)
+                    curr_size = self._compression.get_factor_numel(
+                        p.shape,
+                        name=name,
+                        factor_kind=self._active_compression_factor,
+                        rank=rank_c,
+                    )
+                else:
+                # 一维向量或较小向量：直接取全部
+                    curr_size = p.numel()
+                
+                compressed_vector = compressed_pad_buffers[group_idx][start:start + curr_size]
+                grad = self._compression.decompress(
+                    compressed_vector,
+                    p.size(),
+                    p.numel(),
+                    name,
+                    step=self._num_steps,
+                    factor_kind=self._active_compression_factor,
+                )
+            else:
+                group_idx_p, _, start_p, end_p = self._param_group_idx[name]
+                grad = self._pad_buffers[group_idx][start_p:end_p].view(p.shape).clone()  # ✅ 赋值给 grad
+                
+
+            # grad = grad.view(-1)          # 统一 shape
+            grad.div_(size())             # ✅ 在局部变量上做，不碰 p.grad
+            if update_norm_enabled:
+                group_update_norm_sq_terms.append(torch.sum(grad.detach().float() ** 2))
+            
+            self._sgd(p,grad)
+        if update_norm_enabled:
+            if not hasattr(self, '_active_update_norm_group_sums') or self._active_update_norm_group_sums is None:
+                self._active_update_norm_group_sums = {}
+            if group_update_norm_sq_terms:
+                module_update_norm_sq = torch.stack(group_update_norm_sq_terms).sum()
+                prev_norm_sq = self._active_update_norm_group_sums.get(group_idx)
+                if prev_norm_sq is None:
+                    self._active_update_norm_group_sums[group_idx] = module_update_norm_sq
+                else:
+                    self._active_update_norm_group_sums[group_idx] = prev_norm_sq + module_update_norm_sq
+            _, sub_idx = self._module_group_idx[module_name]
+            if sub_idx == self._group_module_counts[group_idx] - 1:
+                group_norm_sq = self._active_update_norm_group_sums.get(group_idx)
+                if group_norm_sq is None:
+                    group_norm_sq = torch.zeros((), device=self._compression.device)
+                self._compression.observe_global_update_norm_group(
+                    group_norm_sq,
+                    step=self._num_steps - 1,
+                    group_idx=group_idx,
+                )
+                self._active_update_norm_group_sums.pop(group_idx, None)
+        if profile_enabled and strict_sync_enabled and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        update_end = time.perf_counter()
+        self._overlap_profiler.note_update(
+            start_ts=update_start,
+            end_ts=update_end,
+            module_name=module_name,
+            group_idx=group_idx,
+        )
+
+    """ 上面改为了压缩版
+    def _update_one_module(self, module, module_name, group_idx):
+        #Update model parameters in the module
+        pad_grad = self._pad_buffers[group_idx]
+
+        for p in self._module_direct_parameters[module_name]:
+            # copy grad values from buffers复制梯度值
+
+            name = self._param_names.get(p)
+            #if name not in self._param_group_idx:
+            #    continue
+            group_idx_p, _, start_p, end_p = self._param_group_idx[name]
+            assert group_idx_p == group_idx
+            # 原来的一句话，加入压缩后改为下面几句：p.grad.data.view(-1).copy_(pad_grad[start_p:end_p])
+            # 解压梯度（如果使用了压缩）（压缩新增）
+            if self._compression:
+                compressed_grad = pad_grad[start_p:end_p]
+                decompressed_grad = self._compression.decompress(compressed_grad, p.size(),name)
+                p.grad.data.view(-1).copy_(decompressed_grad.view(-1))
+            else:
+                p.grad.data.view(-1).copy_(pad_grad[start_p:end_p])
+
+            # to be checked: average the grad here平均梯度
+            p.grad.data.div_(size())
+            # apply one optimizer step应用优化器步骤
+            self._sgd(p)
+    """
+    
+    # 手写 SGD（weight decay / momentum / nesterov）
+    def _sgd(self, p, grad):
+        # ✅ 优先用传入的 grad，兜底用 p.grad SHAN
+        if grad is None:
+            grad = p.grad
+        if grad is None:
+            return
+        """
+        if p.grad is None:
+            return
+        """
+
+        # 🔹 打印参数 id，用于检查每个参数只被更新一次
+        # print(f"_sgd called for param id={id(p)}, name={self._param_names.get(p)}")
+
+        group = self.param_to_group[p]   # ✅ 修正后的 group 获取方式
+
+        if 'momentum' in group:
+            # ===== SGD =====
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+            lr = group['lr']
+
+            d_p = grad
+
+            with torch.no_grad():
+                if weight_decay != 0:
+                    d_p = d_p.add(p, alpha=weight_decay)
+
+                if momentum > 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = torch.zeros_like(p)
+                        param_state['momentum_buffer'] = buf
+                        buf.copy_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+
+                    if nesterov:
+                        d_p = d_p.add(buf, alpha=momentum)
+                    else:
+                        d_p = buf
+
+                p.add_(d_p, alpha=-lr)
+
+        else:
+            # ===== AdamW =====
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            weight_decay = group['weight_decay']
+
+            state = self.state[p]
+
+            if len(state) == 0:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+
+            state['step'] += 1
+            step_n = state['step']
+
+            grad = grad
+
+            with torch.no_grad():
+                if weight_decay != 0:
+                    p.mul_(1 - lr * weight_decay)
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                exp_avg_sq.clamp_(min=0.0)          # 新增：防止数值误差产生负数
+                    
+                bias_correction1 = 1 - beta1 ** step_n
+                bias_correction2 = 1 - beta2 ** step_n
+
+                step_size = lr * (bias_correction2 ** 0.5) / bias_correction1
+
+                """ 原本写法
+                denom = exp_avg_sq.sqrt().add_(eps)
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+                """
+
+                denom = exp_avg_sq.sqrt().add(eps)   # 非原地，去掉 clamp
+                update = exp_avg / denom
+                p.add_(update, alpha=-step_size)
+                                
+        # 清梯度
+        p.grad = None
+
+    def zero_grad(self):
+        pass
+    
+    def _allgather_one_group(self, group_idx):
+        if self._active_compression_factor is not None:
+            pad_view, shard_view = self._compression_group_buffer_views_for_factor(
+                self._active_compression_factor, group_idx
+            )
+            handle = all_gather_comm.collective_async_(
+                "allGather-group-%d" % group_idx,
+                pad_view,
+                shard_view,
+                profiler=self._overlap_profiler,
+                group_idx=group_idx,
+            )
+        else:
+            pad_grad = self._pad_buffers[group_idx]
+            shard_grad = self._shard_buffers[group_idx]
+            handle = all_gather_comm.collective_async_(
+                "allGather-group-%d" % group_idx,
+                pad_grad,
+                shard_grad,
+                profiler=self._overlap_profiler,
+                group_idx=group_idx,
+            )
+        self._ag_group_handles[group_idx] = handle
+        return handle
+
+    """"    上面改为了压缩版
+    def _allgather_one_group(self, group_idx):
+        # Apply allgather on one group
+        pad_grad = self._pad_buffers[group_idx]
+        shard_grad = self._shard_buffers[group_idx]
+        comm_name = "allGather-group-%d" % group_idx
+        # 真正发起 AG 的地方
+        all_gather_comm.collective_async_(comm_name, pad_grad, shard_grad)        
+    """
+    
+    def _bp_barrier(self):
+        """
+        Synchronize the reduce-scatter operations and start the all-gather on the first group.
+        """
+        # 计时（所有 reduce-scatter 通信 + 被 overlap 剩下的尾巴）  = RS_total_time − backward_overlap_time
+        self._step_update_done = False
+        # 所有RS的同步操作
+        rs_sync_start = time.perf_counter()
+        strict_profile_sync = (
+            self._overlap_profiler.enabled
+            and os.environ.get('DEAR_OVERLAP_NEEDS_SYNC', '0') == '1'
+        )
+        rs_ag_event_wait_issued = False
+        if self._event_sync_enabled and not strict_profile_sync and len(self._rs_launch_order) > 0:
+            _, last_rs_handle = self._rs_launch_order[-1]
+            rs_ag_event_wait_issued = all_gather_comm.wait_event_from(
+                reduce_scatter_comm, last_rs_handle
+            )
+            if rs_ag_event_wait_issued:
+                reduce_scatter_comm.clear_synchronized()
+
+        if not rs_ag_event_wait_issued and self._overlap_profiler.enabled:
+            for group_idx, handle in enumerate(self._rs_group_handles):
+                if handle is None:
+                    continue
+                rs_group_wait_start = time.perf_counter()
+                cuda_elapsed_ms = reduce_scatter_comm.synchronize_handle(handle)
+                self._overlap_profiler.note_rs_complete(
+                    group_idx=group_idx,
+                    start_ts=rs_group_wait_start,
+                    end_ts=time.perf_counter(),
+                    cuda_elapsed_ms=cuda_elapsed_ms,
+                )
+            reduce_scatter_comm.clear_synchronized()
+        elif not rs_ag_event_wait_issued:
+            reduce_scatter_comm.synchronize()
+        self._overlap_profiler.note_rs_sync(
+            start_ts=rs_sync_start,
+            end_ts=time.perf_counter(),
+        )
+        self._rs_group_handles = [None] * self._num_groups
+        self._rs_launch_order = []
+        # print("Rank %d: Step %d, ReduceScatter time: %.10f sec" % (rank(), self._num_steps, rs_time))
+
+        if self._compression and self._num_steps > self._compression.warmup_steps:
+            self._active_compression_factor = self._compression_factor_kind(self._num_steps)
+            self._prepare_active_compression_layout(
+                self._num_steps, self._active_compression_factor
+            )
+            self._log_comm_stats(self._num_steps, self._active_compression_factor)
+            self._active_update_norm_group_sums = {}
+            if hasattr(self._compression, 'begin_global_update_norm_observation'):
+                self._compression.begin_global_update_norm_observation(
+                    self._num_steps, self._num_groups
+                )
+        else:
+            self._active_compression_factor = None
+            self._active_update_norm_group_sums = None
+        
+        # 第一次调用AG 立即调用group0的AG通信
+        self._ag_group_handles = [None] * self._num_groups
+        self._allgather_one_group(group_idx=0)
+        #if rank() == 0:
+            #print("param group flags:", self._param_group_flags)
+            #print("module group flags:", self._module_group_flags)
+        
+        # Clear flags
+        for group_idx in range(len(self._param_group_flags)):
+            self._param_group_flags[group_idx] = [0] * len(self._param_group_flags[group_idx])
+        self._module_group_flags = [0] * self._num_groups
+
+    def step(self, closure=None):
+        """
+        Performs a single optimization step.
+        """
+        if size() > 1:
+            if self._is_refresh_step():
+                self._refresh_drain()
+                self._step_update_done = True
+            else:
+                self._bp_barrier()
+        #else:
+        #    todo: step with non-distributed optimzier
+        # Note: the last step is skipped
+        self._overlap_profiler.mark_step_pending()
+        self._num_steps += 1
+
+        #test_tensor = torch.tensor([rank()]).cuda()
+        #print("test tensor before:", test_tensor)
+        #comm.bcast(test_tensor, 0)
+        #comm.synchronize()
+        #print("test tensor after:", test_tensor)
+
+# 将任意 PyTorch Optimizer 动态包装成 DeAR 分布式优化器
+def DistributedOptimizer(optimizer, model, compression=None, is_sparse=False, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, fp16=False, mgwfbp=False, rdma=False, multi_job_scheduling=False, exclude_parts='', refresh_k=0, active_prefix_enabled=True):
+    """
+    Wrap optimizer to gurantee the consistency. 
+    Warning: some functions are not supported now, so we will simply skip these parameters.
+    Arguments:
+        optimizer: Optimizer to use for computing gradients and applying updates.
+        named_parameters: A mapping between parameter names and values. Used for naming of
+                          allreduce operations. Typically just `model.named_parameters()`.
+        compression: Compression algorithm used during allreduce to reduce the amount
+                     of data sent during the each parameter update step.  Defaults to
+                     not using compression.
+    """
+    # We dynamically create a new class that inherits from the optimizer that was passed in.
+    # The goal is to override the `step()` method with an allreduce implementation.
+    cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
+               dict(_DistributedOptimizer.__dict__))
+
+    return cls(optimizer.param_groups, model, exclude_parts=exclude_parts, compression=compression, refresh_k=refresh_k, active_prefix_enabled=active_prefix_enabled) # 原本compression参数是没有要的（压缩新增）
+
+def broadcast_parameters(params, root_rank):
+    """
+    Broadcasts the parameters from root rank to all other processes.
+    Typical usage is to broadcast the `model.state_dict()`,
+    `model.named_parameters()`, or `model.parameters()`.
+
+    Arguments:
+        params: One of the following:
+            - list of parameters to broadcast
+            - dict of parameters to broadcast
+        root_rank: The rank of the process from which parameters will be
+                   broadcasted to all other processes.
+    """
+    if isinstance(params, dict):
+        params = sorted(params.items())
+    elif isinstance(params, list):
+        # support both named_parameters() and regular parameters()
+        params = [p if isinstance(p, tuple) else (None, p) for p in params]
+    else:
+        raise ValueError('invalid params of type: %s' % type(params))
+
+    # Run asynchronous broadcasts.
+    for name, p in params:
+        if p is not None:
+            comm.bcast(p.view(-1), root_rank)
+    comm.synchronize()
+
+
+def broadcast_optimizer_state(optimizer, root_rank):
+    """
+    Broadcasts an optimizer state from root rank to all other processes.
+
+    Arguments:
+        optimizer: An optimizer.
+        root_rank: The rank of the process from which the optimizer will be
+                   broadcasted to all other processes.
+    """
+    if isinstance(optimizer, torch.optim.LBFGS):
+        # TODO(travis): L-BFGS cannot be easily supported without serializing
+        # the entire state_dict, as its structure is deeply nested and contains
+        # None type parameter values
+        raise ValueError('cannot broadcast torch.optim.LBFGS state')
+
+    state_dict = optimizer.state_dict()
+
+    # Newly created optimizers will not have their state initialized, so
+    # do that initialization here
+    if len(state_dict['state']) == 0:
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                # p.grad = p.data.new(p.size()).zero_()
+                pass
+        # This function accepts a torch.optim.Optimizer or a DistributedOptimizer
+        # wrapped around a torch optimizer. Calling step() with a DistributedOptimizer
+        # forces allreduce on all model parameters, which will result in deadlock
+        # unless every rank calls step(). Therefore, to finish state initialization
+        # only call optimizer.step() with a torch.optim.Optimizer.
+        if optimizer.__module__ == DistributedOptimizer.__module__:
+            super(optimizer.__class__, optimizer).step()
+        else:
+            optimizer.step()
+        state_dict = optimizer.state_dict()
+
+    # If the state_dict is still empty after initialization, then
+    # the optimizer is stateless, and there is nothing to broadcast.
+    # Furthermore, attempting to access the state dict would result in
+    # an error.
+    if len(state_dict['state']) == 0:
+        return
+
+    params = []
+    callbacks = {}
+    occurrences = collections.defaultdict(int)
+
+    # Returns the full type structure of the possibly nested objects for recursive casting back
+    def _get_types(x):
+        if isinstance(x, collections.Iterable):
+            return type(x), [_get_types(xi) for xi in x]
+        else:
+            return type(x)
+
+    # Casts an object encoded in a tensor back into its original type and subtypes
+    def _recursive_cast(x, dtype):
+        if isinstance(dtype, tuple):
+            t, dtypes = dtype
+            x = t(x)
+            return t([_recursive_cast(x[i], dtypes[i]) for i in range(len(x))])
+        else:
+            return dtype(x)
+
+    # Some optimizer parameters may be represented as scalars instead of
+    # tensors.  In such cases, we need to wrap the scalar in a tensor, then
+    # broadcast, then update the appropriate value in the state_dict with the
+    # new unwrapped scalar value via a callback.
+    def _create_callback(pid, name, t, p):
+        def _from_tensor():
+            state_dict['state'][pid][name] = t(p.numpy()[0])
+        return _from_tensor
+
+    def _create_option_callback(index, option_key, option_tensor, dtypes):
+        def _from_tensor():
+            optimizer.param_groups[index][option_key] = _recursive_cast(option_tensor.numpy()[0], dtypes)
+        return _from_tensor
+
+    # Param groups are an ordered list, normally there is only one per model,
+    # but users can add additional param groups for example to train
+    # previously frozen layers
+    for index, group in enumerate(state_dict['param_groups']):
+        # Broadcast options like learning rate
+        for option_key, option_value in group.items():
+            if option_key == 'params':
+                continue
+
+            # Options like the learning rate are scalar, and need to be wrapped in tensors
+            key = '%s.%d' % (option_key, index)
+            dtypes = _get_types(option_value)
+            option_tensor = torch.Tensor([option_value])
+            callbacks[key] = _create_option_callback(index, option_key, option_tensor, dtypes)
+            params.append((key, option_tensor))
+
+        # The params list here is ordered by the layers in the model
+        for pid in group['params']:
+            param_state = state_dict['state'][pid]
+            for name, p in param_state.items():
+                # Some parameter names may appear more than once, in which
+                # case we ensure they have a unique identifier defined by
+                # their order
+                occurrences[name] += 1
+                key = '%s.%d' % (str(name), occurrences[name])
+
+                if p is not None and not torch.is_tensor(p):
+                    # Wrap the scalar in a FloatTensor, and remember its type
+                    # so we can cast it back after unwrapping
+                    t = type(p)
+                    p = torch.Tensor([p])
+                    callbacks[key] = _create_callback(pid, name, t, p)
+
+                params.append((key, p))
+
+    # Synchronized broadcast of all parameters
+    broadcast_parameters(params, root_rank)
+
+    # Post-broadcast clenaup for non-tensor parameters
+    for key, _ in params:
+        if key in callbacks:
+            callbacks[key]()
+
+# 备用，但主流程 没有用它（被 RS+AG 替代）
+def allreduce(tensor, name=None):
+    comm.allReduce(tensor.view(-1))
+    comm.synchronize()
+    return tensor/size()

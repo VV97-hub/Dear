@@ -20,3 +20,8 @@ export LD_LIBRARY_PATH=$MPI_HOME/lib:$CUDA_HOME/lib64:$NCCL_HOME/lib:$CONDA_PREF
 
 python3 setup.py clean
 python3 setup.py install
+
+
+# 操作像这样：
+# rm -rf build *.egg-info
+# bash compile.sh

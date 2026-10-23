@@ -344,8 +344,12 @@ echo $cmd
 if [ "$rdma" = "0" ]; then
 $MPIPATH/bin/mpirun --prefix $MPIPATH -np $nworkers -hostfile "$HOSTFILE" -bind-to none --map-by slot\
     -mca btl_tcp_if_include ${ETH_MPI_BTC_TCP_IF_INCLUDE} \
-    -x NCCL_DEBUG=VERSION  \
-    -x NCCL_SOCKET_IFNAME=${ETH_INTERFACE} \
+    -x NCCL_DEBUG=INFO  \
+    -x NCCL_SOCKET_IFNAME=bond0 \
+    -x NCCL_IB_HCA=mlx5_0,mlx5_bond_0 \
+    -x NCCL_IB_GID_INDEX=3 \
+    -x UCX_MEMTYPE_CACHE=n \
+    -x UCX_WARN_UNUSED_ENV_VARS=n \
     -x NCCL_IB_DISABLE=0 \
     -x NCCL_LAUNCH_MODE=PARALLEL \
     -x DEAR_EVENT_SYNC \

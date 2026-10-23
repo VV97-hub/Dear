@@ -1,0 +1,62 @@
+[
+  {
+    "archived_name": "generate_experiment_figures.py",
+    "original_name": "generate_acpr_experiment_figures_20260624.py",
+    "sha256": "2656c88bbb1e8fead33ed2e5d5485e3b96cb3b5e684cfd3f36957d7052475d1d"
+  },
+  {
+    "archived_name": "plot_final_fig8.py",
+    "original_name": "plot_fig8.py",
+    "sha256": "4872ec2d142e5ebc2575d88e8dbca611669d5c90afaf0a777f1820fa88dbab25"
+  },
+  {
+    "archived_name": "plot_final_fig7_performance.py",
+    "original_name": "plot_performance.py",
+    "sha256": "ada3372a5d9b6fd8e3456976f5d229dd260ded136fbedc552112a2be58aa1458"
+  },
+  {
+    "archived_name": "apply_visible_window_labels.py",
+    "original_name": "package.py",
+    "sha256": "3fb6e9973a725af30624dbc7e9d76d5aaaeae055ed764a78b7ed23046fe337d6"
+  },
+  {
+    "archived_name": "plot_fig10_scaleout.py",
+    "original_name": "plot_fig10_scaleout_s1_s4.py",
+    "sha256": "73751a10891830c4ff2e30a1cf3d9b05679c6d2779698b893978dcfa938f87c7"
+  },
+  {
+    "archived_name": "plot_gpt_loss.py",
+    "original_name": "plot_gpt_loss_convergence_full.py",
+    "sha256": "408f27c474cdddc2521e9e3c8bd12c8088828a36b895829121f2c82ecbf1fc97"
+  },
+  {
+    "archived_name": "plot_cifar_accuracy.py",
+    "original_name": "plot_cifar_accuracy.py",
+    "sha256": "4c328bec88bd1ab0607938076d9c0a2791e7ebabe69f2e16b210d56ba1e88c26"
+  },
+  {
+    "archived_name": "generate_overall_visible_windows.py",
+    "original_name": "generate_overall_gantt_exposed_wait.py",
+    "sha256": "6ff7e3840e060b0d796c1afcf945ce9473fd9fbf4b908e58ed76c64d2f486a09"
+  },
+  {
+    "archived_name": "generate_group_visible_windows.py",
+    "original_name": "generate_per_group_gantt_exposed_wait.py",
+    "sha256": "862ae0fd12a43ee9a1a8fd26bacf4257fe32d42d50b222ed6895d57f5ffc984a"
+  },
+  {
+    "archived_name": "audit_fig56_visible_windows.py",
+    "original_name": "audit_fig56.py",
+    "sha256": "2814906c0eadc2b09d1e392b845b5d472513ec4b59c81fa6feb4688810c3f7b3"
+  },
+  {
+    "archived_name": "plot_handoff_host_labels.py",
+    "original_name": "plot_handoff.py",
+    "sha256": "1ba61fed61b89b4f0742a18a85dbe39331f0365207833f6263e78f6c7c2570eb"
+  },
+  {
+    "archived_name": "draw_mechanism_figures.py",
+    "original_name": "acpr_redraw_mechanism_figs_times_fig1_aligned.py",
+    "sha256": "be5298c8324dd579b9e870701085faa71ce690e578502bac53521fe8ee07faa8"
+  }
+]
