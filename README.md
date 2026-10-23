@@ -1,3 +1,16 @@
+# Helix：成熟版与复现入口
+
+本仓库在 DeAR 的基础上保存 Helix 的实现和历史开发记录。2026-10-24 已完成服务器停用前的代码与论文数据来源核对。
+
+- **成熟算法基线：** `main`，对应算法提交 `d15bcf7`。本次主分支只增加说明文档。
+- **最新完整复现归档：** [`archive/helix-paper-repro-20261024`](https://github.com/VV97-hub/Dear/tree/archive/helix-paper-repro-20261024)，包含服务器实际运行支持修改、实验脚本、绘图代码和环境清单。
+- **历史 timeline 测量版：** [`archive/helix-timeline-20260706`](https://github.com/VV97-hub/Dear/tree/archive/helix-timeline-20260706)，对应 `3d00e8c`，用途与主性能版本不同。
+- **各分支用途、版本选择和重编译方式：** [HELIX_BRANCH_GUIDE.md](HELIX_BRANCH_GUIDE.md)。
+
+以下保留原 DeAR 项目的介绍与安装背景。
+
+---
+
 # DeAR: <u>de</u>coupling the <u>a</u>ll-<u>r</u>educe primitive to accelerate distributed deep learning
 
 ## Introduction 
