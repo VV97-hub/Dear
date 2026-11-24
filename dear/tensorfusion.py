@@ -4,6 +4,7 @@ import numpy as np
 from comm_core import rank, size, Communicator
 import os
 import time
+import helix_nvtx
 
 
 NUM_NEARBY_LAYERS=3 # DenseNet-201 10GbE 64-GPU
@@ -479,19 +480,23 @@ class CommReduceScatter:
         self._name_tensors[name] = (pad_tensor, shard_tensor)
         if self._event_sync_enabled and hasattr(self.merged_comm, 'waitCurrentStream'):
             if self.op == CollectiveOp.REDUCE_SCATTER:
-                self.merged_comm.waitCurrentStream()
+                with helix_nvtx.range('producer_wait_enqueue', name=name, group_idx=group_idx):
+                    self.merged_comm.waitCurrentStream()
         else:
             current_stream = torch.cuda.current_stream(device=pad_tensor.device)
-            current_stream.synchronize()
+            with helix_nvtx.range('producer_host_sync', name=name, group_idx=group_idx):
+                current_stream.synchronize()
 
         if self.op == CollectiveOp.REDUCE_SCATTER:
             if profiler is not None:
                 profiler.note_rs_issue(group_idx=group_idx)
-            handle = self.merged_comm.reduceScatter(pad_tensor, shard_tensor)
+            with helix_nvtx.range('rs_submit', name=name, group_idx=group_idx, send_numel=pad_tensor.numel(), recv_numel=shard_tensor.numel(), bytes=pad_tensor.numel() * pad_tensor.element_size()):
+                handle = self.merged_comm.reduceScatter(pad_tensor, shard_tensor)
         elif self.op == CollectiveOp.ALL_GATHER:
             if profiler is not None:
                 profiler.note_ag_issue(group_idx=group_idx)
-            handle = self.merged_comm.allGather(shard_tensor, pad_tensor)
+            with helix_nvtx.range('ag_submit', name=name, group_idx=group_idx, send_numel=shard_tensor.numel(), recv_numel=pad_tensor.numel(), bytes=shard_tensor.numel() * shard_tensor.element_size()):
+                handle = self.merged_comm.allGather(shard_tensor, pad_tensor)
         else:
             raise TypeError
         self.handles.append((handle, shard_tensor, pad_tensor))
@@ -513,6 +518,7 @@ class CommReduceScatter:
     def synchronize_name(self, name):
         return self.synchronize_handle(self._handles_by_name.get(name))
 
+    @helix_nvtx.annotate('rs_ag_wait_enqueue', ('handle',))
     def wait_event_from(self, producer_comm, handle):
         if handle is None:
             return False
@@ -521,6 +527,7 @@ class CommReduceScatter:
             return True
         return False
 
+    @helix_nvtx.annotate('ag_compute_wait_enqueue', ('handle',))
     def wait_event_on_current_stream(self, handle):
         if handle is None:
             return False
@@ -536,6 +543,7 @@ class CommReduceScatter:
         self.handles.clear()
         self._handles_by_name.clear()
 
+    @helix_nvtx.annotate('comm_host_sync', ())
     def synchronize(self):
         self.merged_comm.synchronize()
         if not self._event_sync_enabled:

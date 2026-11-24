@@ -7,6 +7,7 @@ import numpy as np
 import time
 import math
 import utils
+import helix_nvtx
 from scipy import stats
 
 class Reducer:
@@ -416,11 +417,13 @@ class HalfRankKReducer(Reducer):
         if len(obs['seen_groups']) >= obs['num_groups']:
             self._finish_global_update_norm_observation(obs)
 
+    @helix_nvtx.annotate('norm_decision', ())
     def _finish_global_update_norm_observation(self, obs):
         if not obs['norm_sq_terms']:
             return
         norm_sq = torch.stack(obs['norm_sq_terms']).sum()
-        norm_value = float(torch.sqrt(norm_sq).item())
+        with helix_nvtx.range('norm_host_read', source_step=obs['step']):
+            norm_value = float(torch.sqrt(norm_sq).item())
 
         old_ema = self.global_update_norm_ema
         old_norm = self.global_update_norm_last
@@ -533,6 +536,7 @@ class HalfRankKReducer(Reducer):
             return n * rank
         return m * rank
 
+    @helix_nvtx.annotate('orthogonalize', ())
     def _orthogonalize_factor(self, factor):
         if factor.numel() == 0:
             return
@@ -556,6 +560,7 @@ class HalfRankKReducer(Reducer):
         vector.data[:] = torch.randn(*vector.shape, device=self.device)
         self._orthogonalize_factor(vector)
 
+    @helix_nvtx.annotate('factor_state', ('name', 'step'))
     def _prepare_tensor_memory(self, tensor, name=None, step=0):
         if name is None:
             name = 'default'
@@ -618,35 +623,44 @@ class HalfRankKReducer(Reducer):
             flush=True,
         )
 
+    @helix_nvtx.annotate('compress', ('name', 'step', 'factor_kind'))
     def compute_factor(self, tensor, name=None, step=0, factor_kind=None, update_residual=True):
         if not self.should_compress_tensor(tensor, name=name):
             return tensor.contiguous().clone()
         if factor_kind is None:
             factor_kind = self.factor_kind(step)
         grad_matrix, key, rank, p, q = self._prepare_tensor_memory(tensor, name, step)
-        matrix = grad_matrix + self.residuals[key]
-        self._debug_log_pq_shapes(
-            name,
-            tensor.shape,
-            grad_matrix.shape[0],
-            grad_matrix.shape[1],
-            rank,
-            step,
-            factor_kind,
-        )
-        with torch.no_grad():
-            if factor_kind == 'p':
-                self._orthogonalize_factor(q)
-                p.copy_(torch.matmul(matrix, q))
-                compressed = p.contiguous().clone()
-            else:
-                self._orthogonalize_factor(p)
-                q.copy_(torch.matmul(matrix.t(), p))
-                compressed = q.contiguous().clone()
-            if update_residual:
-                self.residuals[key].copy_(matrix - p @ q.t())
+        with helix_nvtx.context(rank=rank, factor=factor_kind):
+            with helix_nvtx.range('add_residual', name=name, step=step, rank=rank):
+                matrix = grad_matrix + self.residuals[key]
+            self._debug_log_pq_shapes(
+                name,
+                tensor.shape,
+                grad_matrix.shape[0],
+                grad_matrix.shape[1],
+                rank,
+                step,
+                factor_kind,
+            )
+            with torch.no_grad():
+                if factor_kind == 'p':
+                    self._orthogonalize_factor(q)
+                    with helix_nvtx.range('project_p', name=name, step=step, rank=rank):
+                        p.copy_(torch.matmul(matrix, q))
+                    with helix_nvtx.range('factor_copy', name=name, source_step=step, rank=rank, factor='p'):
+                        compressed = p.contiguous().clone()
+                else:
+                    self._orthogonalize_factor(p)
+                    with helix_nvtx.range('project_q', name=name, step=step, rank=rank):
+                        q.copy_(torch.matmul(matrix.t(), p))
+                    with helix_nvtx.range('factor_copy', name=name, source_step=step, rank=rank, factor='q'):
+                        compressed = q.contiguous().clone()
+                if update_residual:
+                    with helix_nvtx.range('ef_update', name=name, step=step, rank=rank):
+                        self.residuals[key].copy_(matrix - p @ q.t())
         return compressed
 
+    @helix_nvtx.annotate('load_factor', ('name', 'step', 'factor_kind'))
     def load_factor(self, compressed_data, original_tensor_size, name, step=0, factor_kind=None):
         if not self.should_compress_shape(original_tensor_size, name=name):
             return
@@ -657,11 +671,13 @@ class HalfRankKReducer(Reducer):
         if factor_kind is None:
             factor_kind = self.factor_kind_for_update(step)
         with torch.no_grad():
-            if factor_kind == 'p':
-                p.copy_(compressed_data.view(p.shape))
-            else:
-                q.copy_(compressed_data.view(q.shape))
+            with helix_nvtx.range('factor_load_copy', name=name, rank=rank, factor=factor_kind):
+                if factor_kind == 'p':
+                    p.copy_(compressed_data.view(p.shape))
+                else:
+                    q.copy_(compressed_data.view(q.shape))
 
+    @helix_nvtx.annotate('reconstruct', ('name',))
     def reconstruct_from_memory(self, original_tensor_size, name):
         if not self.should_compress_shape(original_tensor_size, name=name):
             return None
@@ -669,8 +685,10 @@ class HalfRankKReducer(Reducer):
         rank = self.rank_memory.get(key, self.max_rank_for(name))
         p = self.p_memory[key][:, :rank]
         q = self.q_memory[key][:, :rank]
-        return (p @ q.t()).view(original_tensor_size)
+        with helix_nvtx.range('reconstruct_matmul', name=name, rank=rank):
+            return (p @ q.t()).view(original_tensor_size)
 
+    @helix_nvtx.annotate('refresh_ef_update', ('name',))
     def update_residual_from_memory(self, tensor, name):
         if not self.should_compress_tensor(tensor, name=name):
             return
@@ -684,6 +702,7 @@ class HalfRankKReducer(Reducer):
         with torch.no_grad():
             self.residuals[key].copy_(grad_matrix + self.residuals[key] - p @ q.t())
 
+    @helix_nvtx.annotate('codec_encode', ('name', 'step'))
     def compress(self, tensor, name=None, step=0, **kwargs):
         """
         对单个tensor执行半步PowerSGD压缩（奇偶步交替算p/q）。
@@ -705,9 +724,10 @@ class HalfRankKReducer(Reducer):
             update_residual=True,
         ), None, None
 
+    @helix_nvtx.annotate('codec_decode', ('name', 'step', 'factor_kind'))
     def decompress(self, compressed_data, original_tensor_size, numel, name, step=0, factor_kind=None):
         """
-        用通信后的p或q重构梯度，并更新Error Feedback残差。
+        用通信后的p或q重构梯度；普通路径的本地残差已在编码时更新。
 
         动态rank注意事项：
           decompress必须与compress使用同一step（dopt_rsag中应保持一致），

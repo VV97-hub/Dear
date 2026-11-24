@@ -8,6 +8,8 @@ import torch.optim as optim
 import torch
 import torch.backends.cudnn as cudnn
 import os
+import helix_nvtx
+import helix_capture
 from compression import compressors
 from datasets import load_dataset
 import dopt_rsag as hvd
@@ -134,8 +136,10 @@ parser.add_argument('--local-rank', type=int, default=0)
 
 # TODO 打印上面四个值；方便查看
 
+helix_capture.add_arguments(parser)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
+nvtx_capture = helix_capture.Capture(args)
 overlap_enabled = args.overlap_summary or args.overlap_timeline
 overlap_needs_sync = (
     (args.overlap_summary and args.overlap_summary_mode == 'strict') or
@@ -620,19 +624,23 @@ def _record_convergence(step, loss_value):
 
         
             
+@nvtx_capture.annotate_step
 def benchmark_step():
     global step, data_iter
 
     # 从 DataLoader 取一个 batch，耗尽时重新循环
     try:
-        batch = next(data_iter)
+        with helix_nvtx.range('data_next'):
+            batch = next(data_iter)
     except StopIteration:
         sampler.set_epoch(step)   # 每轮重新shuffle
         data_iter = iter(train_loader)
-        batch = next(data_iter)
+        with helix_nvtx.range('data_next'):
+            batch = next(data_iter)
 
     if args.cuda:
-        batch = {k: v.cuda() for k, v in batch.items()}
+        with helix_nvtx.range('batch_h2d'):
+            batch = {k: v.cuda() for k, v in batch.items()}
 
     input_ids         = batch['input_ids']
     attention_masks   = batch['attention_mask']
@@ -653,10 +661,12 @@ def benchmark_step():
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_forward_start'):
         optimizer.profile_forward_start()
-    outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_masks)
+    with helix_nvtx.range('forward', step=step):
+        outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_masks)
     prediction_scores = outputs.prediction_logits
     seq_relationship_score = outputs.seq_relationship_logits
-    loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_label)
+    with helix_nvtx.range('loss', step=step):
+        loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_label)
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_forward_done'):
@@ -670,13 +680,15 @@ def benchmark_step():
         optimizer.profile_backward_start()
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
-    loss.backward()
+    with helix_nvtx.range('backward', step=step):
+        loss.backward()
     if overlap_needs_sync and args.cuda:
         torch.cuda.synchronize()
     if overlap_enabled and hasattr(optimizer, 'profile_backward_done'):
         optimizer.profile_backward_done()
     
-    optimizer.step()
+    with helix_nvtx.range('step_submit', step=step):
+        optimizer.step()
 
     """ # 这里可以打印一轮训练中：forward、backward、optimizer_step、total等时间
     timings = {
@@ -719,6 +731,8 @@ for x in range(args.num_iters):
     log('Iter #%d: %.1f sentences/sec per GPU' % (x, sen_sec))
     img_secs.append(sen_sec)
     iter_times.append(total_time / args.num_batches_per_iter)
+
+nvtx_capture.finish()
 
 # Results 输出每个迭代的吞吐量、平均迭代时间（带置信区间）、单GPU和总多GPU的句子/秒性能。
 img_sec_mean = np.mean(img_secs)

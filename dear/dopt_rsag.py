@@ -31,6 +31,7 @@ from comm_core import rank, size, Communicator, init as comm_init
 from tensorfusion import CommReduceScatter, CollectiveOp
 import utils
 from compression import compressors
+import helix_nvtx
 
 
 comm_init()
@@ -1076,6 +1077,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         return active_offsets_p, active_offsets_q, group_sizes_p, group_sizes_q
 
+    @helix_nvtx.annotate('layout_prepare', ('step', 'factor_kind'))
     def _prepare_active_compression_layout(self, step, factor_kind):
         if not self._compression:
             return
@@ -1175,6 +1177,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             shard_buffers[group_idx][:shard_size],
         )
 
+    @helix_nvtx.annotate('padding', ('factor_kind', 'group_idx'))
     def _zero_active_padding_for_factor(self, factor_kind, group_idx):
         pad_buffers, _ = self._compression_buffers_for_factor(factor_kind)
         group_sizes, padded_sizes = self._active_group_sizes_for_factor(factor_kind)
@@ -1272,6 +1275,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     def _other_factor_kind(self, factor_kind):
         return 'q' if factor_kind == 'p' else 'p'
 
+    @helix_nvtx.annotate('refresh_pack', ('name',))
     def _refresh_push_to_buffer(self, name, tensor):
         group_idx, sub_idx, start_p, end_p = self._param_group_idx[name]
         with torch.no_grad():
@@ -1282,6 +1286,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     return
             self._refresh_pending_first_groups.append(group_idx)
 
+    @helix_nvtx.annotate('refresh_encode_first', ('group_idx',))
     def _refresh_launch_first_group(self, group_idx):
         step = self._num_steps
         first_kind = self._compression_factor_kind(step)
@@ -1293,7 +1298,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         pad_buf = pad_buffers[group_idx]
         group_size = self._active_group_sizes_for_factor(first_kind)[0][group_idx]
         if group_size > 0:
-            pad_buf[:group_size].zero_()
+            with helix_nvtx.range('padding', group_idx=group_idx):
+                pad_buf[:group_size].zero_()
         for name in self._compression_param_groups[group_idx]:
             p = self._param_by_name[name]
             _, _, raw_start, raw_end = self._param_group_idx[name]
@@ -1307,19 +1313,23 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             )
             _, start, end = offsets[name]
             actual_end = start + vector.numel()
-            pad_buf[start:actual_end].copy_(vector.view(-1))
+            with helix_nvtx.range('pack', group_idx=group_idx):
+                pad_buf[start:actual_end].copy_(vector.view(-1))
             if actual_end < end:
-                pad_buf[actual_end:end].zero_()
+                with helix_nvtx.range('padding', group_idx=group_idx):
+                    pad_buf[actual_end:end].zero_()
         self._zero_active_padding_for_factor(first_kind, group_idx)
         pad_view, _ = self._compression_group_buffer_views_for_factor(first_kind, group_idx)
         if hasattr(refresh_first_comm, 'waitCurrentStream'):
             refresh_first_comm.waitCurrentStream()
         else:
             torch.cuda.current_stream(device=pad_view.device).synchronize()
-        handle = refresh_first_comm.allReduce(pad_view)
+        with helix_nvtx.range('refresh_allreduce_first', group_idx=group_idx, send_numel=pad_view.numel(), bytes=pad_view.numel() * pad_view.element_size()):
+            handle = refresh_first_comm.allReduce(pad_view)
         self._refresh_first_handles[group_idx] = -1 if handle is None else handle
         self._refresh_launch_order.append(group_idx)
 
+    @helix_nvtx.annotate('refresh_load', ('group_idx', 'factor_kind'))
     def _refresh_load_factor_group(self, group_idx, factor_kind):
         offsets = self._compression_offsets_for_factor(factor_kind)
         pad_buffers, _ = self._compression_buffers_for_factor(factor_kind)
@@ -1344,6 +1354,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 factor_kind=factor_kind,
             )
 
+    @helix_nvtx.annotate('refresh_encode_second', ('group_idx',))
     def _refresh_launch_second_group(self, group_idx):
         step = self._num_steps
         second_kind = self._refresh_second_kind
@@ -1353,7 +1364,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         pad_buf = pad_buffers[group_idx]
         group_size = self._active_group_sizes_for_factor(second_kind)[0][group_idx]
         if group_size > 0:
-            pad_buf[:group_size].zero_()
+            with helix_nvtx.range('padding', group_idx=group_idx):
+                pad_buf[:group_size].zero_()
         for name in self._compression_param_groups[group_idx]:
             p = self._param_by_name[name]
             if not self._compression.should_compress_tensor(p, name=name):
@@ -1369,18 +1381,22 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             )
             _, start, end = offsets[name]
             actual_end = start + vector.numel()
-            pad_buf[start:actual_end].copy_(vector.view(-1))
+            with helix_nvtx.range('pack', group_idx=group_idx):
+                pad_buf[start:actual_end].copy_(vector.view(-1))
             if actual_end < end:
-                pad_buf[actual_end:end].zero_()
+                with helix_nvtx.range('padding', group_idx=group_idx):
+                    pad_buf[actual_end:end].zero_()
         self._zero_active_padding_for_factor(second_kind, group_idx)
         pad_view, _ = self._compression_group_buffer_views_for_factor(second_kind, group_idx)
         if hasattr(refresh_second_comm, 'waitCurrentStream'):
             refresh_second_comm.waitCurrentStream()
         else:
             torch.cuda.current_stream(device=pad_view.device).synchronize()
-        handle = refresh_second_comm.allReduce(pad_view)
+        with helix_nvtx.range('refresh_allreduce_second', group_idx=group_idx, send_numel=pad_view.numel(), bytes=pad_view.numel() * pad_view.element_size()):
+            handle = refresh_second_comm.allReduce(pad_view)
         self._refresh_second_handles[group_idx] = -1 if handle is None else handle
 
+    @helix_nvtx.annotate('refresh_wait_first', ('group_idx', 'blocking'))
     def _refresh_finish_first_group(self, group_idx, blocking=False):
         handle = self._refresh_first_handles[group_idx]
         if handle is None or self._refresh_first_done[group_idx]:
@@ -1399,11 +1415,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             return False
         first_kind = self._refresh_first_kind
         first_pad_buffers, _ = self._compression_buffers_for_factor(first_kind)
-        first_pad_buffers[group_idx].div_(size())
+        with helix_nvtx.range('gradient_average', group_idx=group_idx):
+            first_pad_buffers[group_idx].div_(size())
         self._refresh_load_factor_group(group_idx, first_kind)
         self._refresh_first_done[group_idx] = True
         return True
 
+    @helix_nvtx.annotate('refresh_wait_second', ('group_idx', 'blocking'))
     def _refresh_finish_second_group(self, group_idx, blocking=False):
         handle = self._refresh_second_handles[group_idx]
         if handle is None or self._refresh_second_done[group_idx]:
@@ -1422,11 +1440,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             return False
         second_kind = self._refresh_second_kind
         second_pad_buffers, _ = self._compression_buffers_for_factor(second_kind)
-        second_pad_buffers[group_idx].div_(size())
+        with helix_nvtx.range('gradient_average', group_idx=group_idx):
+            second_pad_buffers[group_idx].div_(size())
         self._refresh_load_factor_group(group_idx, second_kind)
         self._refresh_second_done[group_idx] = True
         return True
 
+    @helix_nvtx.annotate('refresh_progress', ('blocking',))
     def _refresh_progress(self, blocking=False):
         while True:
             made_progress = False
@@ -1454,6 +1474,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         for group_idx in self._refresh_launch_order:
             self._refresh_finish_second_group(group_idx, blocking=blocking)
 
+    @helix_nvtx.annotate('refresh_update', ('group_idx',))
     def _refresh_update_group(self, group_idx):
         first_kind = self._refresh_first_kind
         first_offsets = self._compression_offsets_for_factor(first_kind)
@@ -1471,6 +1492,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 grad = first_pad_buf[start:end].view(p.shape).clone()
             self._sgd(p, grad)
 
+    @helix_nvtx.annotate('refresh_drain', ())
     def _refresh_drain(self):
         if not self._refresh_launch_order and not self._refresh_pending_first_groups:
             return
@@ -1580,6 +1602,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             #    print("register hook for %s" % self._param_names.get(p))
     
     def _make_hook(self, p):
+        @helix_nvtx.hook(self, p)
         def hook(grad):
             name = self._param_names.get(p)
 
@@ -1607,7 +1630,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 compressed_pad_buffers, compressed_shard_buffers = self._compression_buffers_for_factor(factor_kind)
 
                 # 调用压缩函数
-                compressed_vector, _, _ = self._compression.compress(tensor, name, step=self._num_steps)
+                with helix_nvtx.range('compress_param', name=name, source_step=self._num_steps, group_idx=self._param_group_idx[name][0], factor=factor_kind):
+                    compressed_vector, _, _ = self._compression.compress(tensor, name, step=self._num_steps)
                 # 写入压缩专用 buffer
                 group_idx, start, end = compressed_offsets[name]
 
@@ -1618,9 +1642,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     # 因为 P 和 Q 的长度可能不一致，我们 buffer 是按 max 分配的
                     actual_end = start + compressed_vector.numel()
                     # print(f"name={name}, compressed_vector size={compressed_vector.numel()}, buf slot size={end-start}")
-                    pad_buf[start:actual_end].copy_(compressed_vector.view(-1))
+                    with helix_nvtx.range('pack', name=name, source_step=self._num_steps, group_idx=group_idx, factor=factor_kind):
+                        pad_buf[start:actual_end].copy_(compressed_vector.view(-1))
                     if actual_end < end:
-                        pad_buf[actual_end:end].zero_()
+                        with helix_nvtx.range('padding', group_idx=group_idx):
+                            pad_buf[actual_end:end].zero_()
                     # 标记 flag（复用原有 flag 机制）
                     # 这里没有和（原有逻辑）一样： 调用pad_grad，而是自己复现了（如果一个组的flag都ok了，说明整个通信组才可以触发通信）
                     _, sub_idx, _, _ = self._param_group_idx[name]
@@ -1690,6 +1716,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return hook
     """
 
+    @helix_nvtx.annotate('dense_pack', ('name',))
     def _push_to_buffer(self, name, tensor):
         """
         Push tensor to buffer for fusion.
@@ -1706,6 +1733,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             shard_buffer = self._shard_buffers[group_idx]
             return comm_name, pad_buffer, shard_buffer
 
+    @helix_nvtx.annotate('forward_gate', ())
     def _forward_pre_hook(self, module, input):
         """
         Add hooks for pre-feedfoward.
@@ -1763,6 +1791,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     module_name=name,
                 )
 
+    @helix_nvtx.annotate('module_update', ('module_name', 'group_idx'))
     def _update_one_module(self, module, module_name, group_idx):
         # -------------------------------------------------------下面的代码加上之后 compress不报NaN-------------------------------------------------------
         # torch.cuda.synchronize()
@@ -1818,13 +1847,16 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 )
             else:
                 group_idx_p, _, start_p, end_p = self._param_group_idx[name]
-                grad = self._pad_buffers[group_idx][start_p:end_p].view(p.shape).clone()  # ✅ 赋值给 grad
+                with helix_nvtx.range('dense_unpack', group_idx=group_idx):
+                    grad = self._pad_buffers[group_idx][start_p:end_p].view(p.shape).clone()  # ✅ 赋值给 grad
                 
 
             # grad = grad.view(-1)          # 统一 shape
-            grad.div_(size())             # ✅ 在局部变量上做，不碰 p.grad
+            with helix_nvtx.range('gradient_average', name=name, group_idx=group_idx):
+                grad.div_(size())             # ✅ 在局部变量上做，不碰 p.grad
             if update_norm_enabled:
-                group_update_norm_sq_terms.append(torch.sum(grad.detach().float() ** 2))
+                with helix_nvtx.range('norm_reduce', name=name, group_idx=group_idx):
+                    group_update_norm_sq_terms.append(torch.sum(grad.detach().float() ** 2))
             
             self._sgd(p,grad)
         if update_norm_enabled:
@@ -1887,6 +1919,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     """
     
     # 手写 SGD（weight decay / momentum / nesterov）
+    @helix_nvtx.annotate('optimizer_update', ())
     def _sgd(self, p, grad):
         # ✅ 优先用传入的 grad，兜底用 p.grad SHAN
         if grad is None:
@@ -1984,6 +2017,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
     def zero_grad(self):
         pass
     
+    @helix_nvtx.annotate('ag_schedule', ('group_idx',))
     def _allgather_one_group(self, group_idx):
         if self._active_compression_factor is not None:
             pad_view, shard_view = self._compression_group_buffer_views_for_factor(
@@ -2019,6 +2053,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         all_gather_comm.collective_async_(comm_name, pad_grad, shard_grad)        
     """
     
+    @helix_nvtx.annotate('rs_to_ag', ())
     def _bp_barrier(self):
         """
         Synchronize the reduce-scatter operations and start the all-gather on the first group.
