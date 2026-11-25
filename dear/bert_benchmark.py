@@ -16,6 +16,11 @@ from transformers.utils import logging
 import math
 logging.set_verbosity_error()
 
+# Pin each local MPI rank to its GPU before Horovod/NCCL initialization.
+# This is required when a Slurm node exposes multiple GPUs to one job.
+_local_rank_env = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")))
+if torch.cuda.is_available():
+    torch.cuda.set_device(_local_rank_env)
 
 hvd.init()
 
