@@ -180,7 +180,7 @@ class RuntimeSemanticsTests(unittest.TestCase):
                 # empty VALUE entries. Use explicit read-only safe.directory.
                 env={k:v for k,v in os.environ.items() if not k.startswith('GIT_CONFIG_')}
                 original=subprocess.check_output(
-                    ['git','-c','safe.directory='+str(ROOT),'show','5f02802:'+relative],
+                    ['git','-c','safe.directory='+str(ROOT),'show','93bdad75bec4fa29bafcaf588ee1fdb416eb4545:'+relative],
                     cwd=ROOT,env=env).decode('utf-8')
                 current=(ROOT/relative).read_text(encoding='utf-8')
                 before=StripAnnotations().visit(ast.parse(original))
