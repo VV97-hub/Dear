@@ -3,22 +3,31 @@
 适用范围：当前 `Dear/dear/bert_benchmark.py` + 分布式 `halfrankk` 路径。
 本版本修复了原草稿的导入顺序错误，补齐自动 BP 算子标记、分阶段标记、
 连续采集窗口、MPI/rank/Slurm 启动接线及基于 CUDA launch 关联的统计脚本。
-本版本用于 GitHub `扩刊-2026-11-24` 分支的代码审阅，尚未在真实训练 GPU 上验证。
-训练服务器仍需同步本次代码，并完成两 rank 短测；不能把分支提交视为服务器已部署。
+本代码维护在 GitHub `扩刊-2026-11-24` 测量分支，算法开发与正式训练维护在 main。
+开发分支、测量分支及同步方式见 [分支说明](../HELIX_BRANCH_GUIDE.md)。
 
 2026-11-25：已合并 main 的服务器适配提交 `93bdad7`，包括通信初始化前的本地 MPI
 rank/GPU 绑定、保留已配置的网络接口、NCCL/UCX 启动参数及编译脚本注释。
-NVTX 测量代码现以该运行基线为对照；这些合并不代表已完成真实 GPU 采集验证。
+NVTX 测量代码以该运行基线为对照。
+
+2026-11-26：旧启动链路的两 rank 作业 `1405471` 已完成 GPU 冒烟采集，BP、
+PowerSGD 编码/解码和 NCCL kernel 可归类；其窗口包含训练预热，不能作为稳态性能数据。
+新增集中配置入口的提交为 `ae04ef8`，推荐从
+[measurement_nvtx/README.md](measurement_nvtx/README.md) 使用 `experiment.conf` 和 `submit.sh`。
+该入口已通过 CPU 回归、Linux 启动集成测试、参数预览及 Slurm `--test-only`；
+这些检查不等于新入口已完成真实训练采集。CPU 热点采样仍需实际计算节点具备 perf 权限。
 
 ## 1. 入口文件
 
 | 文件 | 用途 |
 |---|---|
+| `measurement_nvtx/experiment.conf`、`submit.sh` | 当前推荐入口：集中配置、预览和 Slurm 提交 |
+| `measurement_nvtx/submit_experiment.py`、`job.sbatch` | 参数检查、资源申请、每节点 CLI 准备和 MPI 启动 |
 | `helix_nvtx.py` | 可关闭的手工 NVTX 标记、线程内元信息、autograd hook 标记 |
 | `helix_capture.py` | 采集窗口及一次性的 autograd/ATen 自动标记控制 |
-| `measurement_nvtx/run_mpi_nvtx.sh` | MPI 启动；转发开关，选择当前 BERT 测量配置 |
+| `measurement_nvtx/run_mpi_nvtx.sh` | 历史 MPI 入口；保留原调用方式与默认参数 |
 | `measurement_nvtx/profile_rank.sh` | 每个 MPI worker 内启动 nsys，报告名包含 job 和 rank |
-| `measurement_nvtx/submit_nvtx.sbatch` | 原 Slurm 集群的两节点、每节点一张 GPU 作业入口 |
+| `measurement_nvtx/submit_nvtx.sbatch` | 历史两节点 Slurm 入口；新 conf 链路不经过它 |
 | `measurement_nvtx/env_sczd744.sh` | 原 sczd744 软件/互连环境配置；新机器需适配 |
 | `measurement_nvtx/analyze_nvtx.py` | SQLite 中的 kernel 归属、算子汇总和区间重叠统计 |
 

@@ -1,9 +1,10 @@
 # Helix：成熟版与复现入口
 
-本仓库在 DeAR 的基础上保存 Helix 的实现和历史开发记录。2026-10-24 已完成服务器停用前的代码与论文数据来源核对。
+本仓库在 DeAR 的基础上保存 Helix 的实现和历史开发记录。2026-10-24 完成代码与论文数据来源核对，2026-11-26 补充独立的 NVTX 测量入口和开发流程。
 
-- **成熟算法基线：** `main`，对应算法提交 `d15bcf7`。本次主分支只增加说明文档。
-- **最新完整复现归档：** [`archive/helix-paper-repro-20261024`](https://github.com/VV97-hub/Dear/tree/archive/helix-paper-repro-20261024)，包含服务器实际运行支持修改、实验脚本、绘图代码和环境清单。
+- **算法开发与正式训练：** `main`，成熟算法基线为 `d15bcf7`，当前运行适配提交为 `93bdad7`。
+- **NVTX / Nsight 测量：** [`扩刊-2026-11-24`](https://github.com/VV97-hub/Dear/tree/%E6%89%A9%E5%88%8A-2026-11-24)。原标记与分析实现为 `9e949bf`，合并 main 的版本为 `3b2693a`，新增 conf / Slurm 入口为 `ae04ef8`。测量线定期同步 main，算法开发从 main 创建功能分支。
+- **论文完整复现归档：** [`archive/helix-paper-repro-20261024`](https://github.com/VV97-hub/Dear/tree/archive/helix-paper-repro-20261024)，包含服务器实际运行支持修改、实验脚本、绘图代码和环境清单。
 - **历史 timeline 测量版：** [`archive/helix-timeline-20260706`](https://github.com/VV97-hub/Dear/tree/archive/helix-timeline-20260706)，对应 `3d00e8c`，用途与主性能版本不同。
 - **各分支用途、版本选择和重编译方式：** [HELIX_BRANCH_GUIDE.md](HELIX_BRANCH_GUIDE.md)。
 - **NVTX / Nsight 配置与提交：** [单一 conf 入口说明](dear/measurement_nvtx/README.md)。
