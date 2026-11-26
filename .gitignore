@@ -22,3 +22,5 @@ bk/
 *.zip
 __pycache__/
 .git/
+dear/logs/nvtx/
+dear/measurement_nvtx/*.local.conf

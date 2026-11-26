@@ -6,6 +6,7 @@
 - **最新完整复现归档：** [`archive/helix-paper-repro-20261024`](https://github.com/VV97-hub/Dear/tree/archive/helix-paper-repro-20261024)，包含服务器实际运行支持修改、实验脚本、绘图代码和环境清单。
 - **历史 timeline 测量版：** [`archive/helix-timeline-20260706`](https://github.com/VV97-hub/Dear/tree/archive/helix-timeline-20260706)，对应 `3d00e8c`，用途与主性能版本不同。
 - **各分支用途、版本选择和重编译方式：** [HELIX_BRANCH_GUIDE.md](HELIX_BRANCH_GUIDE.md)。
+- **NVTX / Nsight 配置与提交：** [单一 conf 入口说明](dear/measurement_nvtx/README.md)。
 
 以下保留原 DeAR 项目的介绍与安装背景。
 

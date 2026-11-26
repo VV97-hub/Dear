@@ -1,0 +1,3 @@
+dear/measurement_nvtx/*.sh text eol=lf
+dear/measurement_nvtx/*.sbatch text eol=lf
+dear/measurement_nvtx/*.conf text eol=lf
